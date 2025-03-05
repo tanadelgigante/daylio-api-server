@@ -1,0 +1,12 @@
+services:
+  daylio_api:
+    build: .
+    ports:
+      - "3177:5000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - FLASK_ENV=production
+      - IMPORT_INTERVAL=86400  # Intervallo di importazione in secondi (default: 24 ore)
+      - IMPORT_START_HOUR=0    # Ora di inizio delle scansioni (default: mezzanotte)
+    restart: unless-stopped
