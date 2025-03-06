@@ -41,6 +41,9 @@ def init_db():
             full_date TEXT,
             time TEXT,
             mood INTEGER,
+            activities TEXT,
+            note_title TEXT,
+            note TEXT,
             UNIQUE(user, full_date, time)
         )
     """)
@@ -74,8 +77,8 @@ def import_data():
                 for _, row in df.iterrows():
                     try:
                         cursor.execute(
-                            "INSERT INTO mood_entries (user, full_date, time, mood) VALUES (?, ?, ?, ?)",
-                            (user, row["full_date"], row["time"], row["mood"])
+                            "INSERT INTO mood_entries (user, full_date, time, mood, activities, note_title, note) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (user, row["full_date"], row["time"], row["mood"], row["activities"], row["note_title"], row["note"])
                         )
                     except sqlite3.IntegrityError:
                         print(f"Duplicato ignorato: {user}, {row['full_date']}, {row['time']}")
@@ -114,7 +117,7 @@ def get_moods():
     end_date = request.args.get("end_date")
     print(f"Richiesta ricevuta: /moods per user={user}, start_date={start_date}, end_date={end_date}")
     
-    query = "SELECT full_date, time, mood FROM mood_entries WHERE user = ?"
+    query = "SELECT full_date, time, mood, activities, note_title, note FROM mood_entries WHERE user = ?"
     params = [user]
     if start_date:
         query += " AND full_date >= ?"
@@ -130,7 +133,7 @@ def get_moods():
     conn.close()
     
     print(f"Mood trovati: {moods}")
-    return jsonify([{"date": d, "time": t, "mood": m} for d, t, m in moods])
+    return jsonify([{"date": d, "time": t, "mood": m, "activities": a, "note_title": nt, "note": n} for d, t, m, a, nt, n in moods])
 
 if __name__ == "__main__":
     print("Avvio del server...")
