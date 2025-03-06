@@ -5,6 +5,7 @@ services:
       - "3177:5000"
     volumes:
       - ./data:/app/data
+      - ./data.db:/app/data.db
     environment:
       - FLASK_ENV=production
       - IMPORT_INTERVAL=86400  # Intervallo di importazione in secondi (default: 24 ore)
