@@ -1,0 +1,55 @@
+# =============================================================================
+# Daylio API Server — project metadata and tooling configuration
+# -----------------------------------------------------------------------------
+# Project: daylio-api-server v2.0.0  (see version.ini for release versioning)
+# Stack   : Python 3.12+, Flask 3.x, Waitress, APScheduler, PyYAML, no pandas
+# Tooling : ruff (lint) + pytest (tests) + pip-tools (dependency locking)
+# =============================================================================
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daylio-api-server"
+version = "2.0.0"
+description = "Multi-user Daylio server: unified CSV/.daylio import, dual storage (SQLite source of truth + InfluxDB 2.x for analytics), parametric REST API and Influx-only dashboard (Flask + Waitress)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Daylio API Server team" }]
+keywords = ["daylio", "flask", "influxdb", "sqlite", "csv", "api", "dashboard"]
+dependencies = [
+    "flask>=3.0",
+    "waitress>=3.0",
+    "influxdb-client>=1.40",
+    "itsdangerous>=2.1",
+    "werkzeug>=3.0",
+    "PyYAML>=6.0",
+    "APScheduler>=3.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "pip-tools>=7.4",
+]
+
+[project.urls]
+Repository = "https://gitea.example.org/tanadelgigante/daylio-api-server"
+Documentation = "https://gitea.example.org/tanadelgigante/daylio-api-server/wiki"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

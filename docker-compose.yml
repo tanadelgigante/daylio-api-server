@@ -1,13 +1,50 @@
+# =============================================================================
+# Daylio API Server — Docker Compose (Task 0.6, WORKPLAN §5.4/R3/R4)
+# -----------------------------------------------------------------------------
+# Services:
+#   - app      : the multi-user Daylio API server (build from this repo),
+#                published on host port 3177 -> container 5000.
+#   - influxdb : InfluxDB 2.x used as the analytics store (dashboard reads
+#                ONLY from Influx, D4/R4). User-provided composition:
+#                image influxdb:latest, host port 8120 -> 8086, volumes under
+#                /var/influx/, restart: always. First boot requires manual
+#                setup/onboarding (or the documented env vars in Phase 3).
+# Secrets (INFLUX_TOKEN, ADMIN_PASSWORD) come from the shell/.env, never
+# hardcoded here (R7).
+# =============================================================================
+
 services:
   daylio_api:
-    build: .
+    container_name: daylio-api-server
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "3177:5000"
     volumes:
       - ./data:/app/data
-      - ./data.db:/app/data.db
+      - ./config:/app/config:ro
     environment:
-      - FLASK_ENV=production
-      - IMPORT_INTERVAL=86400  # Intervallo di importazione in secondi (default: 24 ore)
-      - IMPORT_START_HOUR=0    # Ora di inizio delle scansioni (default: mezzanotte)
+      - CONFIG_FILE=${CONFIG_FILE:-/app/config/config.example.yml}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in the environment/.env}
+      - INFLUX_URL=${INFLUX_URL:-http://influxdb:8086}
+      - INFLUX_TOKEN=${INFLUX_TOKEN:-}
+      - INFLUX_ORG=${INFLUX_ORG:-tanadelgigante}
+      - INFLUX_BUCKET=${INFLUX_BUCKET:-daylio}
+      - DATA_DIR=${DATA_DIR:-/app/data}
+      - DB_PATH=${DB_PATH:-/app/data/daylio.db}
+    depends_on:
+      - influxdb
     restart: unless-stopped
+
+  influxdb:
+    image: influxdb:latest
+    container_name: influxdb
+    ports:
+      - "8120:8086"
+    volumes:
+      - /var/influx/influxdb:/var/lib/influxdb2
+      - /var/influx/config:/etc/influxdb
+    restart: always

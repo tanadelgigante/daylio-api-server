@@ -1,0 +1,87 @@
+# =============================================================================
+# Daylio API Server — example per-user overrides (YAML)
+# -----------------------------------------------------------------------------
+# LOCATION: config/users.example.yml
+# PURPOSE : Example of per-user configuration overrides (R6, D6, D17).
+#           In production, replicate this file per real user (or merge the
+#           `users:` section into config/config.yml); users are created ONLY
+#           by the admin via the API — this file never creates users, it only
+#           customises their behaviour (import folder, scales, scheduler).
+#
+# SCHEMA  : see docs/WORKPLAN.md §6. Every key is optional and overrides the
+#           matching key of the base configuration (config/config.example.yml).
+# SECRETS : never put secrets here; reference them as "env:VAR_NAME".
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# "Premium" user example: custom import folder, custom import frequency and a
+# CUSTOM mood scale (D8.c — scale sets may differ from user to user).
+# -----------------------------------------------------------------------------
+alice:
+  import_dir: "/srv/daylio/alice"       # per-user import folder (R7b)
+
+  scheduler:                            # APScheduler override for this user
+    interval_seconds: 3600              # scan every hour
+    start_hour: 6                       # from 06:00
+
+  scales:                               # user-specific scale definitions
+    mood:                               # custom mood labels for this user
+      "fantastico": 1                   # 1 = best
+      "bene": 2
+      "così così": 3
+      "male": 4
+      "malissimo": 5                    # 5 = worst
+
+# -----------------------------------------------------------------------------
+# Second user example: default import folder pattern, slower default schedule,
+# and a numeric custom scale (type: "number" with min/max instead of named
+# levels). Also demonstrates overriding a text scale with different levels.
+# -----------------------------------------------------------------------------
+bob:
+  import_dir: "/srv/daylio/bob"
+
+  scheduler:
+    interval_seconds: 43200             # scan every 12h
+    start_hour: 8                       # from 08:00
+
+  scales:
+    stress:                             # user-defined stress scale (different levels)
+      type: "text"
+      values:
+        - "Rilassato"
+        - "Sereno"
+        - "Teso"
+        - "Molto teso"
+    energy:                             # numeric custom scale
+      type: "number"
+      min: 0
+      max: 10
+
+# -----------------------------------------------------------------------------
+# Advanced example: override the value source for the "Scala salute" scale
+# (useful if a user has a different tag group) and restrict which columns are
+# exposed to this user's API calls.
+# -----------------------------------------------------------------------------
+# carol:
+#   import_dir: "/srv/daylio/carol"
+#   scales:
+#     scala_salute:
+#       type: "text"
+#       source: "tag-group:5"
+#       values:
+#         - "ottimo"
+#         - "buono"
+#         - "discreto"
+#         - "sufficiente"
+#         - "mediocre"
+#         - "insufficiente"
+#         - "pessimo"
+#         - "terribile"
+#   columns:
+#     optional:
+#       - "full_date"
+#       - "mood"
+#       - "activities"
+#       - "scales"
+#       - "note_title"
+#       - "note"

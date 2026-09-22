@@ -1,0 +1,8 @@
+# Runtime dependencies (input for pip-compile / requirements.txt / requirements.lock)
+flask>=3.0
+waitress>=3.0
+influxdb-client>=1.40
+itsdangerous>=2.1
+werkzeug>=3.0
+PyYAML>=6.0
+APScheduler>=3.10

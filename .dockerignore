@@ -1,0 +1,27 @@
+# Daylio API Server — Docker build context exclusions
+# Keep the image lean: no git, tests, docs, sample data or local artifacts.
+
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+*.egg-info
+build
+dist
+data.db
+data/
+.env
+tests/
+sample-data/
+docs/
+scripts/
+# NOTE: config/ is intentionally included because Dockerfile copies
+# config/config.example.yml (the default schema). Real deployment configs
+# (config/config.yml with secrets) should be mounted, not baked in.
+Dockerfile
+docker-compose.yml
+requirements-dev.in

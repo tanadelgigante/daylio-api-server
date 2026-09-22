@@ -1,0 +1,168 @@
+# =============================================================================
+# Daylio API Server — example application configuration (YAML)
+# -----------------------------------------------------------------------------
+# LOCATION: config/config.example.yml
+# PURPOSE : Complete, commented example of the base configuration schema.
+#           The application loads this schema (a deployment copy named
+#           config/config.yml, derived from this example) plus environment
+#           variables for secrets. See docs/WORKPLAN.md §6 for the full spec.
+#
+# DECISIONS (confirmed 2026-09-22):
+#   - D17 : Configuration format is YAML, parsed with PyYAML (no TOML).
+#   - D1  : Mood ordering 1 = best ... 5 = worst (5 Italian labels by default).
+#   - D2  : "scala_salute" is an ordered 8-level scale, NOT a tag list.
+#   - D18 : Influx org "tanadelgigante", bucket "daylio"; in CI the test job
+#           builds INFLUX_URL="http://${INFLUX_INSTANCE}" from repo vars.
+#   - Scheduler backend is APScheduler (not native threading).
+#
+# COMMENTS: in English on purpose (R12: README + user docs in English).
+# SECRETS : never put secrets here; reference them as "env:VAR_NAME".
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Application level settings
+# -----------------------------------------------------------------------------
+app:
+  log_level: "INFO"                 # DEBUG | INFO ; WARN/ERROR/FATAL always active
+  timezone: "Europe/Rome"           # used for weekday/date derivation and scheduler
+
+# -----------------------------------------------------------------------------
+# Storage: SQLite (source of truth) + InfluxDB 2.x (analytics/dashboard only)
+# -----------------------------------------------------------------------------
+storage:
+  sqlite_path: "data/daylio.db"     # SQLite file used as the record/audit store
+
+  # InfluxDB 2.x connection. The token and any other secret MUST come from env.
+  #   - Production / local: set INFLUX_URL to the service endpoint, e.g.
+  #     http://192.168.188.120:8120  (D18 — the real InfluxDB service).
+  #   - CI integration tests: the workflow job `test` builds
+  #     INFLUX_URL="http://${INFLUX_INSTANCE}" where INFLUX_INSTANCE is a
+  #     Gitea repo variable of the form "<ip>:<port>".
+  influx_url: "env:INFLUX_URL"      # full URL as env var
+  influx_org: "tanadelgigante"      # D18: confirmed org (NOT kenshiro)
+  influx_bucket: "daylio"           # D18: confirmed bucket
+  influx_token: "env:INFLUX_TOKEN"  # secret from env, never hardcoded
+
+# -----------------------------------------------------------------------------
+# Mood scale: ordered labels -> index (1 = best, 5 = worst)
+# -----------------------------------------------------------------------------
+mood:
+  values:
+    "alla grande": 1                # best
+    "bene": 2
+    "così così": 3
+    "male": 4
+    "malissimo": 5                  # worst
+
+# -----------------------------------------------------------------------------
+# Custom scales (any number). Two kinds:
+#   - type: "text"   -> ordered list of named levels (`values`)
+#   - type: "number" -> numeric range (`min`, `max`)
+# `source` tells the importer where the value lives:
+#   - "column"            -> parsed from the CSV `scales` column ("Name: Level k/N")
+#   - "tag-group:<N>"     -> for .daylio: tags with id_tag_group == N;
+#                            for CSV: matched inside the `activities` column
+# -----------------------------------------------------------------------------
+scales:
+  stress:
+    type: "text"
+    source: "column"                # CSV column `scales`, format "Stress: Moderato 3/5"
+    values:
+      - "Calma"
+      - "Basso"
+      - "Moderato"
+      - "Alto"
+      - "Sopraffatto"
+
+  scala_salute:
+    type: "text"
+    source: "tag-group:5"           # .daylio: tag group 5; CSV: level inside activities
+    values:                         # D2: 8 ordered levels, user-defined order
+      - "ottimo"                    # 1 (best)
+      - "buono"                     # 2
+      - "discreto"                  # 3
+      - "sufficiente"               # 4
+      - "mediocre"                  # 5
+      - "insufficiente"             # 6
+      - "pessimo"                   # 7
+      - "terribile"                 # 8 (worst)
+
+# -----------------------------------------------------------------------------
+# CSV columns: only `full_date` is mandatory (D8.b); other columns optional.
+# `derive` lists columns computed from `full_date` when absent in the CSV.
+# -----------------------------------------------------------------------------
+columns:
+  required:
+    - "full_date"
+  optional:
+    - "date"
+    - "weekday"
+    - "time"
+    - "mood"
+    - "activities"
+    - "scales"
+    - "note_title"
+    - "note"
+  derive:                           # derived from full_date by default (D8.a)
+    - "date"
+    - "weekday"
+
+# -----------------------------------------------------------------------------
+# Scheduler: APScheduler (confirmed 2026-09-22), NOT native threading.
+# `interval_seconds` + `start_hour` are the global defaults; `per_user`
+# overrides them per username. Users can also override it in users.example.yml.
+# -----------------------------------------------------------------------------
+scheduler:
+  backend: "apscheduler"
+  interval_seconds: 86400           # default: scan every 24h
+  start_hour: 0                     # default: start scanning at midnight
+  per_user:                         # override examples (adapt to real users)
+    alice:
+      interval_seconds: 3600        # scan every hour
+      start_hour: 6                 # from 06:00
+    bob:
+      interval_seconds: 43200       # scan every 12h
+      start_hour: 8
+
+# -----------------------------------------------------------------------------
+# Authentication
+#   - Flask signed sessions (itsdangerous) for the Web UI;
+#   - API keys for scripts/automation (R6, confirmed 2026-09-22).
+# -----------------------------------------------------------------------------
+auth:
+  session_ttl: 86400                # session lifetime in seconds (Web UI)
+  api_keys:
+    enabled: true                   # allow API-key authentication for scripts
+
+# -----------------------------------------------------------------------------
+# Logging: DEBUG/INFO configurable at runtime; WARN/ERROR/FATAL always active.
+# The same value can be overridden at runtime with the LOG_LEVEL env var.
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"
+
+# -----------------------------------------------------------------------------
+# Per-user overrides (EXAMPLE ONLY!). In production replicate this section in
+# config/config.yml (or a dedicated users.yml) for each real user created by
+# the admin. Users themselves are created ONLY by the admin via the API
+# (D6); this file never creates users, it only customizes their behaviour.
+# See config/users.example.yml for the standalone override example.
+# -----------------------------------------------------------------------------
+# users:
+#   alice:
+#     import_dir: "/srv/daylio/alice"        # per-user import folder (R7b)
+#     scheduler:
+#       interval_seconds: 3600
+#       start_hour: 6
+#     scales:
+#       mood:                                # "premium" user with custom mood scale
+#         "fantastico": 1
+#         "bene": 2
+#         "così così": 3
+#         "male": 4
+#         "malissimo": 5
+#   bob:
+#     import_dir: "/srv/daylio/bob"
+#     scheduler:
+#       interval_seconds: 43200
+#       start_hour: 8
