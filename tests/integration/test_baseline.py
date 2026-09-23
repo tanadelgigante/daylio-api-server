@@ -47,8 +47,10 @@ def test_app_factory_and_healthz() -> None:
     payload = resp.get_json()
     assert payload["status"] == "ok"
     assert payload["version"] == "2.0.0-SNAPSHOT"
+    # Fase 1 registers the /api blueprint: version endpoint is reachable.
     resp = client.get("/api/version")
-    assert resp.status_code == 404  # blueprint registration arrives in Phase 4
+    assert resp.status_code == 200
+    assert resp.get_json()["name"] == "daylio-api-server"
 
 
 # --- Fase 0 fixture sanity: the mini fixtures are loadable and non-empty ------
