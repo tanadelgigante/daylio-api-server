@@ -51,6 +51,10 @@ def test_app_factory_and_healthz() -> None:
     resp = client.get("/api/version")
     assert resp.status_code == 200
     assert resp.get_json()["name"] == "daylio-api-server"
+    # Fase 4 registers the parametric records endpoints (empty DB -> 200).
+    resp = client.get("/api/records?user=default")
+    assert resp.status_code == 200
+    assert resp.get_json()["records"] == []
 
 
 # --- Fase 0 fixture sanity: the mini fixtures are loadable and non-empty ------

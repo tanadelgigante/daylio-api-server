@@ -26,10 +26,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 from daylio_api import __version__
 from daylio_api.api.routes import bp as api_bp
+from daylio_api.api.routes import legacy_bp
 from daylio_api.config import AppConfig, sync_schema
 from daylio_api.config import load as load_config
 from daylio_api.db.migrations import migrate
@@ -87,12 +88,34 @@ def create_app(
 
     # REST API blueprint (Fase 1: version + configuration reads; more in Phases 4-5).
     app.register_blueprint(api_bp)
+    # Root-level legacy endpoints (old server.py wire contract, read from
+    # day_entries/users). Registered behind the API blueprint on purpose.
+    app.register_blueprint(legacy_bp)
 
     # Minimal liveness endpoint for smoke tests / orchestration.
     @app.get("/healthz")
     def healthz() -> Any:
         payload = {"status": "ok", "version": __version__}
         return jsonify(payload), 200
+
+    # Uniform 404 for UNMATCHED routes (no blueprint context -> app-level).
+    # Blueprint-raised 404s keep the blueprint handler in api/routes.py (the
+    # wire contract is the same); this fallback guarantees that even unknown
+    # /api/* paths answer JSON. Non-API requests without JSON in Accept (e.g.
+    # the future dashboard/static, Fase 6) fall back to a minimal HTML page.
+    @app.errorhandler(404)
+    def _app_not_found(exc: Any) -> Any:
+        message = str(getattr(exc, "description", None) or "not found")
+        wants_json = request.path.startswith("/api/") or bool(
+            request.accept_mimetypes and request.accept_mimetypes.accept_json
+        )
+        if wants_json:
+            return jsonify({"error": message, "type": "not_found"}), 404
+        body = (
+            "<!doctype html><html><head><title>404 Not Found</title></head>"
+            f"<body><h1>Not Found</h1><p>{message}</p></body></html>"
+        )
+        return body, 404, {"Content-Type": "text/html"}
 
     log.info("Flask app created (version=%s)", __version__)
     return app
