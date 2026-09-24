@@ -60,14 +60,13 @@ def parse_daylio(path: str | Path, config: dict[str, Any] | None = None) -> Impo
         ValueError: on non-ZIP input, missing ``backup.daylio`` member, or
             invalid Base64/JSON payload.
     """
-    config if isinstance(config, AppConfig) else config_module.load()
+    cfg = config if isinstance(config, AppConfig) else config_module.load()
     file_path = Path(path)
     result = ImportResult(source="upload", filename=str(file_path), status="running")
 
     doc = _read_backup_document(file_path)
     result.total_rows = len(doc.get("dayEntries") or [])
 
-    _index_moods(doc)
     tags = _index_tags(doc)
     scales = _index_scales(doc)
 
@@ -76,11 +75,12 @@ def parse_daylio(path: str | Path, config: dict[str, Any] | None = None) -> Impo
         result.records.append(record)
 
     log.info(
-        "daylio %s parsed: %d entries, %d records, %d warnings",
+        "daylio %s parsed: %d entries, %d records, %d warnings (config scales: %d)",
         file_path,
         result.total_rows,
         len(result.records),
         result.warnings,
+        len(cfg.scales or {}),
     )
     result.finish()
     return result
@@ -116,15 +116,6 @@ def _read_backup_document(path: Path) -> dict[str, Any]:
     if version != 15:
         log.info("daylio %s: backup version %r (reference is 15, parse defensively)", path, version)
     return doc
-
-
-def _index_moods(doc: dict[str, Any]) -> dict[int, dict[str, Any]]:
-    """Index ``customMoods`` by numeric id (D1: id equals the rank 1..5)."""
-    return {
-        int(mood["id"]): mood
-        for mood in doc.get("customMoods") or []
-        if isinstance(mood, dict) and "id" in mood
-    }
 
 
 def _index_tags(doc: dict[str, Any]) -> dict[int, dict[str, Any]]:

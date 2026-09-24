@@ -42,6 +42,7 @@ storage:
   influx_org: "tanadelgigante"      # D18: confirmed org (NOT kenshiro)
   influx_bucket: "daylio"           # D18: confirmed bucket
   influx_token: "env:INFLUX_TOKEN"  # secret from env, never hardcoded
+  influx_measurement: "daylio_entry"  # measurement holding ONE point per (user, date)
 
 # -----------------------------------------------------------------------------
 # Mood scale: ordered labels -> index (1 = best, 5 = worst)

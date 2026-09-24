@@ -1,18 +1,27 @@
-"""SQLite store: connection holder + configuration-table reads (Fase 1).
+"""SQLite store: connection holder + configuration/record/user accessors.
 
 =============================== MAINTENANCE NOTES ===============================
 Module   : src/daylio_api/db/sqlite_store.py
 Scope    : Fase 0 (Task 0.2/0.4) connection holder, extended in Fase 1 with the
            ``migrate()`` bootstrap call and the read accessors for the
-           configuration tables (columns_config, scales_config, mood_map) used
-           by the Fase 1 read endpoints. Versioned, idempotent migrations live
-           in ``db/migrations.py``; the record tables (day_entries with
-           UNIQUE(user, full_date), import_jobs, users) are applied in Phases
-           3/5 (WORKPLAN §7).
+           configuration tables (columns_config, scales_config, mood_map), and
+           in Fase 3 (R3/R5, WORKPLAN §7) with the daily-record store:
+           ``upsert_entry``/``get_entry``/``list_entries``/``count_entries``
+           against ``day_entries`` (UNIQUE(user, full_date), D3) plus the
+           minimal ``users`` helpers (structure only; real auth is Phase 5).
 
-Writer  : schema seeding/syncing lives in ``config.seed_defaults`` /
-           ``config.sync_schema`` (Task 1.2/1.4) — this module stays a reader
-           for configuration data to keep the SQL in one place.
+Record contract : ``upsert_entry(conn, user, entry)`` accepts a
+           ``NormalizedEntry`` (importers.base) or the canonical dict returned
+           by its ``as_dict()`` (WORKPLAN §5.3/§5.5 step 6). It persists:
+           - activities as a JSON array string;
+           - scales as the §5.3 JSON object
+             ``{"Stress": {"value": 3, "label": "Moderato"}, ...}`` built from
+             the normalizer's scales list + ``scala_salute``.
+
+Transaction  :  store functions are statement-oriented and do NOT commit; the
+           coordinator (``import_flow.import_data``) owns the transaction and
+           commits once at the end. The ``connect()`` method also applies the
+           versioned migrations so a store is always schema-ready on open.
 ==================================================================================
 """
 
@@ -40,18 +49,24 @@ def _json_loads(raw: str | None, *, default: Any) -> Any:
 
 
 class SqliteStore:
-    """Thin SQLite connection holder + configuration-table readers.
+    """Thin SQLite connection holder + configuration/record accessors.
 
     Args:
-        db_path: filesystem path of the SQLite database (default ``data.db``).
+        db_path: filesystem path of the SQLite database. Defaults to
+            ``data/daylio.db`` (WORKPLAN §6); ``DB_PATH``/``DATA_DIR`` env
+            overrides are applied by ``config.load`` on the storage section.
     """
 
-    def __init__(self, db_path: str | Path = "data.db") -> None:
+    def __init__(self, db_path: str | Path = "data/daylio.db") -> None:
         self.db_path = Path(db_path)
         self._conn: sqlite3.Connection | None = None
 
     def connect(self) -> sqlite3.Connection:
-        """Open (or reuse) a SQLite connection, creating parent dirs."""
+        """Open (or reuse) a SQLite connection, creating parent dirs.
+
+        Also applies the versioned, idempotent migrations so a freshly opened
+        store is always schema-ready (Fase 3: users/day_entries/import_jobs).
+        """
         if self._conn is not None:
             return self._conn
         if self.db_path.parent != Path("."):
@@ -60,6 +75,9 @@ class SqliteStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         log.debug("SQLite connected: %s", self.db_path)
+        from daylio_api.db.migrations import migrate as apply_migrations
+
+        apply_migrations(self._conn)
         return self._conn
 
     def migrate(self) -> int:
@@ -187,3 +205,203 @@ class SqliteStore:
         conn = self.connect()
         rows = conn.execute("SELECT mood_level, label FROM mood_map ORDER BY mood_level").fetchall()
         return [{"level": row["mood_level"], "label": row["label"]} for row in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Daily records (Fase 3 — R5/D3): one row per (user, full_date)
+# --------------------------------------------------------------------------- #
+#: Columns updated by the ON CONFLICT upsert (every mutable field, D3).
+_UPSERT_COLUMNS = (
+    "time",
+    "mood",
+    "mood_label",
+    "activities",
+    "scales",
+    "note_title",
+    "note",
+    "source",
+)
+
+_UPSERT_SQL = f"""
+INSERT INTO day_entries (user, full_date, {", ".join(_UPSERT_COLUMNS)})
+VALUES (?, ?, {", ".join("?" for _ in _UPSERT_COLUMNS)})
+ON CONFLICT(user, full_date) DO UPDATE SET
+    {", ".join(f"{col} = excluded.{col}" for col in _UPSERT_COLUMNS)},
+    updated_at = datetime('now')
+"""
+
+
+def _entry_dict(entry: Any) -> dict[str, Any]:
+    """Normalize a ``NormalizedEntry`` (or canonical dict) to a plain dict."""
+    if hasattr(entry, "as_dict"):
+        return entry.as_dict()
+    return dict(entry)
+
+
+def _scales_object(entry_dict: dict[str, Any]) -> dict[str, Any]:
+    """Build the §5.3 ``scales`` JSON object from the canonical record.
+
+    The normalizer exposes scales as a list of ``{scale_name, label, rank,
+    levels_count, scale_key}`` plus a separate ``scala_salute`` field; the store
+    persists the object form ``{display_name: {"value": rank, "label": label}}``
+    required by WORKPLAN §5.3.
+    """
+    scales: dict[str, Any] = {}
+    for scale in entry_dict.get("scales") or []:
+        if not isinstance(scale, dict):
+            continue
+        name = str(scale.get("scale_name") or "")
+        if name:
+            scales[name] = {
+                "value": int(scale.get("rank") or 0),
+                "label": str(scale.get("label") or ""),
+            }
+    salute = entry_dict.get("scala_salute")
+    if isinstance(salute, dict) and salute.get("label"):
+        scales.setdefault(
+            "Scala salute",
+            {"value": int(salute.get("rank") or 0), "label": str(salute["label"])},
+        )
+    return scales
+
+
+def _row_to_record(row: sqlite3.Row) -> dict[str, Any]:
+    """Convert a ``day_entries`` row to a JSON-ready dict (JSON columns parsed)."""
+    record = dict(row)
+    record["activities"] = _json_loads(record.get("activities"), default=[])
+    record["scales"] = _json_loads(record.get("scales"), default={})
+    return record
+
+
+def upsert_entry(conn: sqlite3.Connection, user: str, entry: Any) -> str:
+    """Insert or fully update one daily record (D3 upsert, R5).
+
+    Uses ``INSERT ... ON CONFLICT(user, full_date) DO UPDATE`` and returns
+    ``"imported"`` when a new row was created or ``"updated"`` when an existing
+    day was replaced. All mutable fields are overwritten on conflict.
+
+    Args:
+        conn: SQLite connection (caller owns the transaction/commit).
+        user: the record owner (placeholder ``"default"`` until Phase 5).
+        entry: a ``NormalizedEntry`` or the canonical dict from ``as_dict()``.
+
+    Returns:
+        ``"imported"`` if a row was inserted, ``"updated"`` otherwise.
+    """
+    data = _entry_dict(entry)
+    full_date = str(data.get("full_date") or "").strip()
+    if not full_date:
+        raise ValueError("upsert_entry requires a non-empty full_date")
+    data.setdefault("source", "csv")
+
+    existing = conn.execute(
+        "SELECT 1 FROM day_entries WHERE user = ? AND full_date = ?",
+        (user, full_date),
+    ).fetchone()
+
+    params = (
+        user,
+        full_date,
+        str(data.get("time") or ""),
+        int(data.get("mood") or 0),
+        str(data.get("mood_label") or ""),
+        json.dumps(data.get("activities") or [], ensure_ascii=False),
+        json.dumps(_scales_object(data), ensure_ascii=False),
+        str(data.get("note_title") or ""),
+        str(data.get("note") or ""),
+        str(data.get("source") or "csv"),
+    )
+    conn.execute(_UPSERT_SQL, params)
+    return "updated" if existing is not None else "imported"
+
+
+def get_entry(conn: sqlite3.Connection, user: str, full_date: str) -> dict[str, Any] | None:
+    """Return the daily record for ``(user, full_date)`` as a parsed dict."""
+    row = conn.execute(
+        "SELECT * FROM day_entries WHERE user = ? AND full_date = ?",
+        (user, full_date),
+    ).fetchone()
+    return _row_to_record(row) if row is not None else None
+
+
+def list_entries(
+    conn: sqlite3.Connection,
+    user: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return the user's daily records ordered by ``full_date DESC``.
+
+    Args:
+        conn: SQLite connection.
+        user: record owner.
+        start_date: optional inclusive lower bound ``YYYY-MM-DD``.
+        end_date: optional inclusive upper bound ``YYYY-MM-DD``.
+        limit: optional row cap (applied after ordering).
+    """
+    sql = "SELECT * FROM day_entries WHERE user = ?"
+    params: list[Any] = [user]
+    if start_date:
+        sql += " AND full_date >= ?"
+        params.append(start_date)
+    if end_date:
+        sql += " AND full_date <= ?"
+        params.append(end_date)
+    sql += " ORDER BY full_date DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [_row_to_record(row) for row in rows]
+
+
+def count_entries(conn: sqlite3.Connection, user: str) -> int:
+    """Return the number of daily records for ``user`` (== number of days)."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM day_entries WHERE user = ?", (user,)
+    ).fetchone()
+    return int(row["n"]) if row is not None else 0
+
+
+# --------------------------------------------------------------------------- #
+# Minimal users helpers (structure only — real auth lands in Phase 5)
+# --------------------------------------------------------------------------- #
+def get_or_create_user(
+    conn: sqlite3.Connection,
+    username: str,
+    *,
+    is_admin: bool = False,
+    import_dir: str | None = None,
+) -> int:
+    """Return the ``users.id`` for ``username``, creating the row if needed.
+
+    Phase 3 keeps this structure-only: there is no password hashing yet. The
+    created user is inert until Phase 5 adds auth.
+    """
+    row = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if row is not None:
+        return int(row["id"])
+    cursor = conn.execute(
+        "INSERT INTO users (username, is_admin, import_dir) VALUES (?, ?, ?)",
+        (username, int(bool(is_admin)), import_dir),
+    )
+    return int(cursor.lastrowid)
+
+
+def set_import_dir(conn: sqlite3.Connection, username: str, import_dir: str) -> None:
+    """Update ``users.import_dir`` for ``username`` (Phase 5 folder import)."""
+    conn.execute(
+        "UPDATE users SET import_dir = ?, updated_at = datetime('now') "
+        "WHERE username = ?",
+        (import_dir, username),
+    )
+
+
+def list_users(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return all ``users`` rows (Phase 5 read endpoints / resync iteration)."""
+    rows = conn.execute(
+        "SELECT id, username, is_admin, import_dir, created_at, updated_at "
+        "FROM users ORDER BY username"
+    ).fetchall()
+    return [dict(row) for row in rows]

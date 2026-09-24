@@ -6,6 +6,8 @@ MAINTENANCE NOTES:
       files (kept for later phases) and to the mini fixtures under
       ``tests/fixtures/`` (versioned, small, derived from the real ones).
     - ``config_sample`` : loads the example configuration (schema reference).
+    - ``fake_influx_client`` / ``influx_store`` : injectable InfluxDB fake
+      (Fase 3) so store/import introspection never touches the network.
     - ``captured_logs`` : installs the logger capture handler for the duration
       of a test and always restores it afterwards.
 """
@@ -18,6 +20,8 @@ import pytest
 
 from daylio_api import config as config_module
 from daylio_api import logger as logger_module
+from daylio_api.db.influx_store import InfluxConfig, InfluxStore
+from tests.fakes import FakeInfluxClient
 
 TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
@@ -71,3 +75,28 @@ def captured_logs() -> list[str]:
     started = logger_module.capture()
     yield started
     logger_module.release()
+
+
+@pytest.fixture
+def fake_influx_client() -> FakeInfluxClient:
+    """Fresh in-memory InfluxDB fake (Fase 3, delete-and-write semantics)."""
+    return FakeInfluxClient()
+
+
+@pytest.fixture
+def influx_store(fake_influx_client: FakeInfluxClient) -> InfluxStore:
+    """Configured InfluxStore bound to the fake client (no real endpoint).
+
+    The url/token are dummy values that only make ``is_configured()`` True;
+    all wire traffic is intercepted by the fake (R8 CI-safe).
+    """
+    return InfluxStore(
+        InfluxConfig(
+            url="http://fake-influx:8120",
+            token="fake-token",
+            org="tanadelgigante",
+            bucket="daylio",
+            measurement="daylio_entry",
+        ),
+        client=fake_influx_client,
+    )

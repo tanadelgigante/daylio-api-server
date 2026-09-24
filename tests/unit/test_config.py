@@ -444,24 +444,24 @@ def test_schema_source_invalid_raises(tmp_path: Path) -> None:
 def test_migrate_double_call_idempotent_file_db(tmp_path: Path) -> None:
     """Two migrate(conn) calls on the same file DB: no error, no duplication.
 
-    PRAGMA user_version must bump exactly once (0 -> 1) and stay there; a fresh
-    connection opened afterwards sees the same persisted version and a no-op
-    migrate succeeds again.
+    PRAGMA user_version must bump exactly once (0 -> 2, Fase 1 + Fase 3 schema)
+    and stay there; a fresh connection opened afterwards sees the same persisted
+    version and a no-op migrate succeeds again.
     """
     db_path = tmp_path / "idempotent_migrate.db"
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         first_version = migrate(conn)
-        assert first_version == 1
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert first_version == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
 
         # Second call on the SAME connection: no-op, no failure.
         second_version = migrate(conn)
-        assert second_version == 1
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert second_version == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
 
-        # No duplicated tables / rows: all three config tables exist and are
+        # No duplicated tables / rows: all config tables exist and are
         # still empty (nothing was inserted before seeding).
         for table in ("columns_config", "scales_config", "mood_map"):
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -475,9 +475,9 @@ def test_migrate_double_call_idempotent_file_db(tmp_path: Path) -> None:
         # Fresh connection sees the persisted schema and can no-op migrate.
         conn2 = sqlite3.connect(db_path)
         try:
-            assert conn2.execute("PRAGMA user_version").fetchone()[0] == 1
-            assert migrate(conn2) == 1
-            assert conn2.execute("PRAGMA user_version").fetchone()[0] == 1
+            assert conn2.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert migrate(conn2) == 2
+            assert conn2.execute("PRAGMA user_version").fetchone()[0] == 2
         finally:
             conn2.close()
     finally:
