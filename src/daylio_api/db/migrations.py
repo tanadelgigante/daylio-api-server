@@ -1,11 +1,12 @@
-"""Versioned, idempotent SQLite migrations (Fase 1 + Fase 3).
+"""Versioned, idempotent SQLite migrations (Fase 1 + Fase 3 + Fase 5).
 
 =============================== MAINTENANCE NOTES ===============================
 Module   : src/daylio_api/db/migrations.py
 Scope    : Fase 1 (R1) — configuration tables (``columns_config``,
-           ``scales_config``, ``mood_map``) and Fase 3 (R3/R5) — the daily
+           ``scales_config``, ``mood_map``), Fase 3 (R3/R5) — the daily
            record store (``users``, ``day_entries`` with UNIQUE(user, full_date)
-           and the ``import_jobs`` audit table, WORKPLAN §5.3). Versioning uses
+           and the ``import_jobs`` audit table, WORKPLAN §5.3) and Fase 5 (D6) —
+           the ``api_keys`` table for API-key authentication. Versioning uses
            ``PRAGMA user_version``: every step is idempotent (``CREATE TABLE
            IF NOT EXISTS`` / ``CREATE INDEX IF NOT EXISTS``) and bumps the
            version inside the same transaction, so a partially applied
@@ -225,6 +226,45 @@ def _migration_002_day_store(conn: sqlite3.Connection) -> None:
         log.warning("Legacy mood_entries migration skipped (%s); nothing lost", exc)
 
 
+def _migration_003_api_keys(conn: sqlite3.Connection) -> None:
+    """v3: ``api_keys`` table for API-key authentication (Fase 5, D6).
+
+    API keys target automation/scripts (R6). Only the SHA-256 hash of the key
+    is stored (``key_hash``); ``key_prefix`` keeps the first characters of the
+    plaintext key so the operator can display/revoke a specific key without
+    ever seeing the secret again. ``user_id`` links to ``users.id``.
+    ``revoked`` is a soft-delete flag so revoked keys stay auditable.
+
+    Note      : ``user_id`` references ``users.id`` (no FK constraint; users
+    deletion is handled by ``sqlite_store.delete_user`` which removes the keys
+    first, keeping the referential integrity at the application level).
+    """
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            key_prefix  TEXT    NOT NULL,
+            key_hash    TEXT    NOT NULL,
+            name        TEXT    NOT NULL DEFAULT '',
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            last_used_at TEXT,
+            revoked     INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1))
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_api_keys_key_hash
+            ON api_keys (key_hash)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS ix_api_keys_user_id
+            ON api_keys (user_id)
+        """,
+    )
+    for statement in statements:
+        conn.execute(statement)
+
+
 def _maybe_migrate_legacy(conn: sqlite3.Connection) -> None:
     """Fold a legacy ``mood_entries`` table into ``day_entries`` (D3).
 
@@ -289,6 +329,7 @@ def _maybe_migrate_legacy(conn: sqlite3.Connection) -> None:
 _MIGRATIONS: Sequence[tuple[str, Callable[[sqlite3.Connection], None]]] = (
     ("001_config_tables", _migration_001_config_tables),
     ("002_day_store", _migration_002_day_store),
+    ("003_api_keys", _migration_003_api_keys),
 )
 
 

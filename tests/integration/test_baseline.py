@@ -10,6 +10,7 @@ from daylio_api import config as config_module
 from daylio_api.app import create_app
 from daylio_api.db.sqlite_store import SqliteStore
 from daylio_api.logger import configure, get_logger
+from tests.helpers import login_assert_ok
 
 
 def test_import_daylio_api_and_version() -> None:
@@ -52,6 +53,8 @@ def test_app_factory_and_healthz() -> None:
     assert resp.status_code == 200
     assert resp.get_json()["name"] == "daylio-api-server"
     # Fase 4 registers the parametric records endpoints (empty DB -> 200).
+    # Fase 5 protects the data routes: log the admin in first (D6).
+    login_assert_ok(client)
     resp = client.get("/api/records?user=default")
     assert resp.status_code == 200
     assert resp.get_json()["records"] == []

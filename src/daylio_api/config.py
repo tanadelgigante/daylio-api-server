@@ -46,6 +46,9 @@ Validation : see ``_validate``. Phase-0 checks (unchanged) plus Fase 1 extras:
     ``optional``/``derive`` are lists of non-empty names, no required/optional
     overlap, every derived column is declared in required or optional;
   - scheduler: ``interval_seconds > 0`` and ``start_hour`` in 0..23;
+    ``enabled``, when present, must be a boolean;
+  - auth: ``session_ttl``, when present, must be a positive integer;
+    ``api_keys`` must be a mapping with a boolean ``enabled``;
   - auth override sanity and ``app.schema_source`` in {yaml, db}.
 ================================================================================
 """
@@ -749,6 +752,21 @@ def _validate(cfg: AppConfig) -> None:
     start_hour = scheduler.get("start_hour")
     if not isinstance(start_hour, int) or not (0 <= start_hour <= 23):
         raise ConfigError("scheduler.start_hour must be an integer in 0..23")
+    enabled = scheduler.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ConfigError("scheduler.enabled must be a boolean")
+
+    # --- auth (Fase 5, D6) ----------------------------------------------- #
+    auth = cfg.auth if isinstance(cfg.auth, dict) else {}
+    session_ttl = auth.get("session_ttl")
+    if session_ttl is not None and (not isinstance(session_ttl, int) or session_ttl <= 0):
+        raise ConfigError("auth.session_ttl must be a positive integer")
+    api_keys_cfg = auth.get("api_keys")
+    if api_keys_cfg is not None:
+        if not isinstance(api_keys_cfg, dict):
+            raise ConfigError("auth.api_keys must be a mapping")
+        if "enabled" in api_keys_cfg and not isinstance(api_keys_cfg["enabled"], bool):
+            raise ConfigError("auth.api_keys.enabled must be a boolean")
 
     # --- per-user scheduler/scales sanity --------------------------------- #
     for username, overrides in cfg.users.items():

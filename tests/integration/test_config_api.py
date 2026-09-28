@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from daylio_api.app import create_app
+from tests.helpers import login_assert_ok
 
 
 @pytest.fixture
@@ -112,6 +113,7 @@ def test_get_columns_user_allow_list(api_client, tmp_path: Path) -> None:
     app.config["TESTING"] = True
     client = app.test_client()
     monkeypatch.undo()
+    login_assert_ok(client)  # D6: ?user= overrides require an authenticated admin
 
     resp = client.get("/api/columns?user=carol")
     assert resp.status_code == 200
@@ -135,6 +137,7 @@ def test_get_scales_user_mood_override(api_client, tmp_path: Path) -> None:
     app.config["TESTING"] = True
     client = app.test_client()
     monkeypatch.undo()
+    login_assert_ok(client)  # D6: ?user= overrides require an authenticated admin
 
     resp = client.get("/api/scales?user=alice")
     assert resp.status_code == 200
@@ -167,6 +170,7 @@ def test_get_scales_user_mood_override_wrapper(api_client, tmp_path: Path) -> No
     app.config["TESTING"] = True
     client = app.test_client()
     monkeypatch.undo()
+    login_assert_ok(client)  # D6: ?user= overrides require an authenticated admin
 
     resp = client.get("/api/scales?user=alice")
     assert resp.status_code == 200  # no 500
@@ -224,6 +228,7 @@ def test_user_overrides_do_not_leak_globally(tmp_path: Path) -> None:
     app.config["TESTING"] = True
     client = app.test_client()
     monkeypatch.undo()
+    login_assert_ok(client)  # D6: ?user= overrides require an authenticated admin
 
     default_mood = ["alla grande", "bene", "così così", "male", "malissimo"]
 
@@ -266,6 +271,7 @@ def test_columns_allow_list_not_global(tmp_path: Path) -> None:
     app.config["TESTING"] = True
     client = app.test_client()
     monkeypatch.undo()
+    login_assert_ok(client)  # D6: ?user= overrides require an authenticated admin
 
     global_resp = client.get("/api/columns")
     assert global_resp.status_code == 200
@@ -293,6 +299,7 @@ def test_get_scales_user_new_scale_appended(api_client, tmp_path: Path) -> None:
     app.config["TESTING"] = True
     client = app.test_client()
     monkeypatch.undo()
+    login_assert_ok(client)  # D6: ?user= overrides require an authenticated admin
 
     resp = client.get("/api/scales?user=bob")
     assert resp.status_code == 200

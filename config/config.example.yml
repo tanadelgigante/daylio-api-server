@@ -110,30 +110,38 @@ columns:
 
 # -----------------------------------------------------------------------------
 # Scheduler: APScheduler (confirmed 2026-09-22), NOT native threading.
+# `enabled` gates the per-user periodic folder imports (Fase 5). It ships
+# FALSE so a default install never runs background jobs silently; enable it
+# after configuring real per-user import folders.
 # `interval_seconds` + `start_hour` are the global defaults; `per_user`
 # overrides them per username. Users can also override it in users.example.yml.
 # -----------------------------------------------------------------------------
 scheduler:
   backend: "apscheduler"
-  interval_seconds: 86400           # default: scan every 24h
-  start_hour: 0                     # default: start scanning at midnight
-  per_user:                         # override examples (adapt to real users)
+  enabled: false                 # Fase 5: periodic imports are opt-in
+  interval_seconds: 86400        # default: scan every 24h
+  start_hour: 0                  # default: start scanning at midnight
+  per_user:                      # override examples (adapt to real users)
     alice:
-      interval_seconds: 3600        # scan every hour
-      start_hour: 6                 # from 06:00
+      interval_seconds: 3600     # scan every hour
+      start_hour: 6              # from 06:00
     bob:
-      interval_seconds: 43200       # scan every 12h
+      interval_seconds: 43200    # scan every 12h
       start_hour: 8
 
 # -----------------------------------------------------------------------------
 # Authentication
 #   - Flask signed sessions (itsdangerous) for the Web UI;
 #   - API keys for scripts/automation (R6, confirmed 2026-09-22).
+# `session_secret` MUST come from env in production (SESSION_SECRET); a missing
+# value only makes sessions not survive a restart (a random key is generated).
 # -----------------------------------------------------------------------------
 auth:
-  session_ttl: 86400                # session lifetime in seconds (Web UI)
+  session_ttl: 86400            # session lifetime in seconds (Web UI)
+  session_cookie_name: "daylio_session"  # signed cookie name
+  session_secret: "env:SESSION_SECRET"   # secret for signed sessions (env!)
   api_keys:
-    enabled: true                   # allow API-key authentication for scripts
+    enabled: true               # allow API-key authentication for scripts
 
 # -----------------------------------------------------------------------------
 # Logging: DEBUG/INFO configurable at runtime; WARN/ERROR/FATAL always active.

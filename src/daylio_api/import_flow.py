@@ -31,9 +31,11 @@ Atomicity     :  all SQLite writes (upserts + audit row) happen in the caller
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from daylio_api import config as config_module
@@ -45,7 +47,15 @@ from daylio_api.db.influx_store import (
     influx_available,
 )
 from daylio_api.db.sqlite_store import get_or_create_user, upsert_entry
-from daylio_api.importers.base import ImportResult, NormalizedEntry
+from daylio_api.importers.base import (
+    FORMAT_CSV,
+    FORMAT_DAYLIO,
+    ImportResult,
+    NormalizedEntry,
+    detect_format,
+)
+from daylio_api.importers.csv_importer import parse_csv
+from daylio_api.importers.daylio_importer import parse_daylio
 from daylio_api.importers.normalizer import normalize
 from daylio_api.logger import get_logger
 
@@ -78,6 +88,26 @@ class ImportSummary:
     detail: list[dict[str, Any]] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-ready summary (used by the /api/import* endpoints)."""
+        return {
+            "user": self.user,
+            "source": self.source,
+            "filename": self.filename,
+            "imported": self.imported,
+            "updated": self.updated,
+            "skipped": self.skipped,
+            "errors": self.errors,
+            "influx_errors": self.influx_errors,
+            "warnings": self.warnings,
+            "total_rows": self.total_rows,
+            "status": self.status,
+            "job_id": self.job_id,
+            "detail": self.detail,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+        }
 
 
 def _entries_from(
@@ -311,3 +341,158 @@ def resync_all(
     if commit:
         conn.commit()
     return stats
+
+
+def _failed_import_summary(
+    conn: Any,
+    user: str,
+    source: str,
+    filename: str,
+    kind: str,
+    message: str,
+) -> ImportSummary:
+    """Build and audit a failed ImportSummary (parse-level failure path).
+
+    ``import_data`` writes the audit row for failures it can reach; a file
+    that fails BEFORE import_data (unreadable format, parser crash) must still
+    leave an ``import_jobs`` trail, so this helper records it directly.
+    """
+    summary = ImportSummary(
+        user=user, source=source, filename=filename, status="failed"
+    )
+    summary.errors += 1
+    summary.detail.append({"level": "error", "kind": kind, "message": str(message)})
+    summary.finished_at = datetime.now(UTC)
+    try:
+        summary.job_id = record_job(
+            conn,
+            user=user,
+            source=source,
+            filename=filename,
+            imported=0,
+            updated=0,
+            skipped=0,
+            errors=summary.errors,
+            detail=summary.detail,
+            started_at=summary.started_at,
+            finished_at=summary.finished_at,
+            status="failed",
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 — audit must never mask the import
+        log.error("audit record_job failed: %s", exc)
+    return summary
+
+
+#: Extensions scanned by :func:`import_folder` (R7a; other files untouched).
+_FOLDER_EXTENSIONS = {".csv", ".daylio"}
+
+
+def import_folder(
+    conn: Any,
+    influx: InfluxStore | None,
+    config: AppConfig,
+    user: str,
+    folder: str | Path,
+    *,
+    source: str = "folder",
+) -> list[dict[str, Any]]:
+    """Scan a per-user folder and import every CSV/.daylio file found (R7a).
+
+    Each candidate file is parsed and persisted through ``import_data`` (same
+    pipeline as the upload endpoint) and then moved OUT of the folder:
+      - completed summary  -> ``<folder>/done/<name>``;
+      - failed summary     -> ``<folder>/failed/<name>``.
+    Files with any other extension are left untouched, so the operator can
+    drop any non-import file in the folder without side effects.
+
+    Args:
+        conn: SQLite connection (import writes are transactional per file).
+        influx: an :class:`InfluxStore` or None (R8 tolerance inherited).
+        config: validated ``AppConfig`` used for parsing/normalizing.
+        user: record owner.
+        folder: directory containing the files to import.
+        source: audit provenance (``folder`` for the on-demand trigger,
+            ``daily`` for the scheduler).
+
+    Returns:
+        Per-file summaries (as dicts via :meth:`ImportSummary.to_dict`) with an
+        extra ``moved_to`` key naming the target directory.
+
+    Raises:
+        FileNotFoundError: when ``folder`` does not exist (the trigger
+            endpoint translates this into a 400).
+    """
+    folder_path = Path(folder)
+    if not folder_path.is_dir():
+        raise FileNotFoundError(f"import folder not found: {folder_path}")
+    done_dir = folder_path / "done"
+    failed_dir = folder_path / "failed"
+    done_dir.mkdir(parents=True, exist_ok=True)
+    failed_dir.mkdir(parents=True, exist_ok=True)
+
+    candidates = sorted(
+        path
+        for path in folder_path.iterdir()
+        if path.is_file() and path.suffix.lower() in _FOLDER_EXTENSIONS
+    )
+    if not candidates:
+        log.info("import folder %s has no .csv/.daylio files to import", folder_path)
+
+    results: list[dict[str, Any]] = []
+    for path in candidates:
+        summary = _import_one_file(conn, influx, config, user, source, path)
+        target = done_dir if summary.status == "completed" else failed_dir
+        moved = target / path.name
+        shutil.move(str(path), str(moved))
+        summary_map = summary.to_dict()
+        summary_map["moved_to"] = str(target)
+        results.append(summary_map)
+        log.info(
+            "folder import %s -> %s (%s, imported=%d, errors=%d)",
+            path,
+            target,
+            summary.status,
+            summary.imported,
+            summary.errors,
+        )
+    return results
+
+
+def _import_one_file(
+    conn: Any,
+    influx: InfluxStore | None,
+    config: AppConfig,
+    user: str,
+    source: str,
+    path: Path,
+) -> ImportSummary:
+    """Import a single folder file, returning its summary.
+
+    Parse-level failures produce a failed summary (and audit row) instead of
+    raising, so one bad file never aborts the whole folder scan (R8). Unknown
+    magic bytes inside a recognized extension are treated as a failed import.
+    """
+    fmt = detect_format(path)
+    try:
+        if fmt == FORMAT_DAYLIO:
+            result = parse_daylio(path, config)
+        elif fmt == FORMAT_CSV:
+            result = parse_csv(path, config)
+        else:
+            return _failed_import_summary(
+                conn,
+                user,
+                source,
+                path.name,
+                "format",
+                f"unrecognized import format: {path}",
+            )
+        return import_data(
+            conn, influx, config, user, source, path.name, result
+        )
+    except Exception as exc:  # noqa: BLE001 — one bad file must not abort the scan
+        log.error("import of %s failed: %s", path, exc)
+        return _failed_import_summary(
+            conn, user, source, path.name, "parse", str(exc)
+        )

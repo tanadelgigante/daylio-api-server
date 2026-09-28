@@ -26,6 +26,7 @@ from daylio_api.db.sqlite_store import SqliteStore
 from daylio_api.import_flow import import_data
 from daylio_api.importers.csv_importer import parse_csv
 from daylio_api.importers.normalizer import normalize
+from tests.helpers import login_assert_ok
 
 #: Deterministic 20-day window taken from the real sample (all dates exist).
 SEED_START = "2026-08-01"
@@ -70,7 +71,10 @@ def api_client(tmp_path: Path, monkeypatch, sample_csv, config_sample):
     monkeypatch.setenv("DB_PATH", str(tmp_db))
     app = create_app()
     app.config["TESTING"] = True
-    return app.test_client()
+    client = app.test_client()
+    # D6: the data routes require authentication; the admin may read any user.
+    login_assert_ok(client)
+    return client
 
 
 # --------------------------------------------------------------------------- #
@@ -108,7 +112,9 @@ def test_records_basic_canonical_shape(api_client) -> None:
 
 def test_records_columns_selection(api_client) -> None:
     """GET /api/records?columns=full_date,mood,scales -> only those keys."""
-    resp = api_client.get("/api/records?columns=full_date,mood,scales")
+    resp = api_client.get(
+        "/api/records?user=default&columns=full_date,mood,scales"
+    )
     assert resp.status_code == 200
     records = resp.get_json()["records"]
     assert records, "expected seeded records"
@@ -145,7 +151,7 @@ def test_records_scales_labels_and_levels_count(api_client) -> None:
 def test_records_date_filter_inclusive(api_client) -> None:
     """start_date/end_date are inclusive bounds (only 2026-08-04 in range)."""
     resp = api_client.get(
-        "/api/records?start_date=2026-08-04&end_date=2026-08-04"
+        "/api/records?user=default&start_date=2026-08-04&end_date=2026-08-04"
     )
     assert resp.status_code == 200
     payload = resp.get_json()
@@ -175,7 +181,7 @@ def test_records_start_after_end_400(api_client) -> None:
 
 def test_records_pagination(api_client) -> None:
     """page/limit slicing with total preserved."""
-    resp = api_client.get("/api/records?page=2&limit=8")
+    resp = api_client.get("/api/records?user=default&page=2&limit=8")
     assert resp.status_code == 200
     payload = resp.get_json()
     assert payload["total"] == SEED_COUNT
@@ -184,7 +190,9 @@ def test_records_pagination(api_client) -> None:
     assert len(payload["records"]) == 8
 
     # Pages are contiguous slices over the DESC ordering.
-    first_page = api_client.get("/api/records?page=1&limit=8").get_json()["records"]
+    first_page = api_client.get(
+        "/api/records?user=default&page=1&limit=8"
+    ).get_json()["records"]
     all_dates = [record["full_date"] for record in first_page + payload["records"]]
     assert all_dates == sorted(all_dates, reverse=True)
 
@@ -281,10 +289,16 @@ def test_import_jobs_user_and_limit(api_client) -> None:
 # Legacy backward compatibility (old server.py wire contract)
 # --------------------------------------------------------------------------- #
 def test_legacy_users_shape(api_client) -> None:
-    """GET /users -> [{"user": ..., "records": n}] (grouped from day_entries)."""
+    """GET /users -> [{"user": ..., "records": n}] for EVERY users row (D6).
+
+    The legacy wire contract used the YAML user list; we now serve the ``users``
+    table, so the bootstrapped admin is listed with 0 records alongside the
+    seeded ``default`` user with their record count.
+    """
     resp = api_client.get("/users")
     assert resp.status_code == 200
-    assert resp.get_json() == [{"user": "default", "records": SEED_COUNT}]
+    by_user = {entry["user"]: entry["records"] for entry in resp.get_json()}
+    assert by_user == {"admin": 0, "default": SEED_COUNT}
 
 
 def test_legacy_moods_exact_keys(api_client) -> None:

@@ -10,6 +10,10 @@ MAINTENANCE NOTES:
       (Fase 3) so store/import introspection never touches the network.
     - ``captured_logs`` : installs the logger capture handler for the duration
       of a test and always restores it afterwards.
+    - ``_phase5_admin_env`` (autouse) : guarantees every ``create_app()`` can
+      bootstrap the admin user (D6) — ``ADMIN_USERNAME``/``ADMIN_PASSWORD``
+      come from the environment. Tests that need other users create them via
+      the admin API.
 """
 
 from __future__ import annotations
@@ -27,6 +31,18 @@ TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
 FIXTURES_DIR = TESTS_DIR / "fixtures"
 SAMPLE_DATA_DIR = PROJECT_ROOT / "sample-data"
+
+
+@pytest.fixture(autouse=True)
+def _phase5_admin_env(monkeypatch) -> None:
+    """(Fase 5, D6) Set the boot-time admin credentials for every test.
+
+    Runs before every test (autouse): ``create_app()`` calls ``init_admin``
+    with these credentials, so the test client can always log in as ``admin``.
+    """
+    monkeypatch.setenv("ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("ADMIN_PASSWORD", "admin-pass")
+    yield
 
 
 @pytest.fixture

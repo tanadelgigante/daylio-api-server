@@ -1,4 +1,4 @@
-"""API blueprint: configuration reads (Fase 1) + parametric records (Fase 4).
+"""API blueprint: configuration reads (Fase 1) + parametric records (Fase 4/5).
 
 =============================== MAINTENANCE NOTES ===============================
 Scope    : Fase 0 predicate (Task 0.2) + Fase 1 (Task 1.3) expose the
@@ -6,11 +6,15 @@ Scope    : Fase 0 predicate (Task 0.2) + Fase 1 (Task 1.3) expose the
            ``GET /api/scales``. Fase 4 (R2/D10) adds the parametric records API:
            ``GET /api/records`` (filters user/date/columns/page/limit),
            ``GET /api/records/<full_date>`` and ``GET /api/import/jobs``
-           (audit). The two legacy endpoints ``GET /users`` and ``GET /moods``
-           keep the old single-file ``server.py`` wire contract, now served
-           from ``day_entries`` (SQLite is the source of truth, D4).
-           Upload/import (POST /api/import), auth and analytics arrive in
-           Phases 5-6 (WORKPLAN §7); routes are public in this phase.
+           (audit). Fase 5 (R6/D6) protects every data route with
+           ``@login_required``, isolates per-user data (``_effective_user``),
+           keeps ``/api/columns``+``/api/scales`` public WITHOUT ``?user=`` and
+           adds ``GET /api/users``, ``POST /api/import`` (upload) and
+           ``POST /api/import/folder`` (per-user folder trigger, R7a). Auth
+           endpoints live in ``api/auth.py``. The two legacy endpoints
+           ``GET /users`` and ``GET /moods`` keep the old single-file
+           ``server.py`` wire contract, now served from ``day_entries``
+           (SQLite is the source of truth, D4) behind login + isolation.
 
 Source   : Config reads are served from the SQLite configuration tables
            (columns_config / scales_config / mood_map) bootstrapped by
@@ -21,29 +25,43 @@ Source   : Config reads are served from the SQLite configuration tables
            ``users.example.yml``.
 
 Errors   : uniform ``{"error": str, "type": <bad_request|not_found|
-           internal_error>}`` handled in this blueprint (Task 4.3). Internal
-           errors are logged at ERROR, no traceback is leaked to the client.
+           unauthorized|forbidden|internal_error>}`` handled in this blueprint
+           (Task 4.3) and at app level for auth errors. Internal errors are
+           logged at ERROR, no traceback is leaked to the client.
 
 Helpers  : ``_store()`` resolves the SqliteStore from ``app.extensions``;
            ``_merge_user_scales`` / ``_scale_from_override`` implement the
            per-user merge without writing to SQLite (multi-user rows land in
-           Phase 5); ``_resolve_user()``/``_valid_date()`` centralize the
-           Fase 4 parameter validation.
+           Phase 5); ``_effective_user()`` resolves the ``?user=`` param
+           against the authenticated viewer with the D6 isolation rules;
+           ``_valid_date()``/``_parse_columns_list()`` centralize the Fase 4
+           parameter validation.
 ==================================================================================
 """
 
 from __future__ import annotations
 
+import csv
+import json
+import os
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from flask import Blueprint, abort, current_app, jsonify, request
 
 from daylio_api import __version__
+from daylio_api.api.auth import current_user, login_required, public_user_with_records
 from daylio_api.api.serializers import serialize_record
 from daylio_api.audit import list_jobs
 from daylio_api.config import mood_override_values, parse_tag_group, scale_label
-from daylio_api.db.sqlite_store import SqliteStore
+from daylio_api.db.influx_store import InfluxStore
+from daylio_api.db.sqlite_store import SqliteStore, list_users_with_counts
+from daylio_api.import_flow import _failed_import_summary, import_data, import_folder
+from daylio_api.importers.base import FORMAT_CSV, FORMAT_DAYLIO, detect_format
+from daylio_api.importers.csv_importer import parse_csv
+from daylio_api.importers.daylio_importer import parse_daylio
 
 bp = Blueprint("api", __name__, url_prefix="/api")
 
@@ -70,6 +88,28 @@ def _store() -> SqliteStore:
     if store is None:
         abort(503, description="SQLite store not initialised")
     return store
+
+
+def _influx() -> InfluxStore | None:
+    """Return the bootstrapped InfluxStore (registered by the app factory)."""
+    return current_app.extensions.get("daylio_influx")
+
+
+def _require_user_access(user: str) -> None:
+    """Gate a ``?user=`` override against the authenticated viewer (D6).
+
+    - anonymous viewer -> 401 (the endpoint is public only WITHOUT ``?user=``);
+    - a non-admin viewer may pass only their own username -> else 403;
+    - an admin may pass any username.
+    """
+    viewer = current_user()
+    if viewer is None:
+        abort(401, description="authentication required")
+    if user == viewer["username"]:
+        return
+    if bool(viewer.get("is_admin")):
+        return
+    abort(403, description="cannot access another user's data")
 
 
 @bp.get("/version")
@@ -109,6 +149,7 @@ def api_columns() -> Any:
     columns = store.get_columns()
     user = request.args.get("user")
     if user:
+        _require_user_access(user)
         user_overrides = _user_overrides(user)
         columns_override = user_overrides.get("columns")
         if isinstance(columns_override, dict) and isinstance(
@@ -155,6 +196,7 @@ def api_scales() -> Any:
     mood_map = store.get_mood_map()
     user = request.args.get("user")
     if user:
+        _require_user_access(user)
         scales, mood_map = _merge_user_scales(scales, mood_map, _user_overrides(user))
     return jsonify({"scales": scales, "mood_map": mood_map})
 
@@ -260,20 +302,27 @@ def _valid_date(value: str | None) -> bool:
     return True
 
 
-def _resolve_user() -> str:
-    """Return the explicit ``?user=`` query param or a sensible default.
+def _effective_user() -> str:
+    """Resolve the requested ``?user=`` against the authenticated viewer (D6).
 
-    Default precedence: the single user declared in the YAML per-user section
-    (when exactly one exists), otherwise the Phase-3 placeholder ``"default"``.
+    Rules (multi-user isolation, Fase 5):
+      - anonymous viewer -> 401 (data routes are ``@login_required`` anyway);
+      - non-admin with ``?user=<other>`` -> 403;
+      - otherwise return the explicit ``?user=`` or the viewer's own username.
+
+    Precondition: the view is ``@login_required``, so ``current_user()`` is not
+    None; the guard is kept for defence in depth.
     """
-    user = request.args.get("user")
-    if user:
-        return user
-    cfg = current_app.config.get("DAYLIO")
-    users = cfg.users if cfg is not None else {}
-    if len(users) == 1:
-        return str(next(iter(users)))
-    return "default"
+    viewer = current_user()
+    if viewer is None:
+        abort(401, description="authentication required")
+    viewer_name = str(viewer["username"])
+    requested = request.args.get("user")
+    if requested is None:
+        return viewer_name
+    if requested == viewer_name or bool(viewer.get("is_admin")):
+        return requested
+    abort(403, description="cannot access another user's data")
 
 
 def _parse_columns_list(value: str | None) -> list[str] | None:
@@ -314,33 +363,53 @@ def _scale_levels_meta() -> dict[str, int]:
 # single-file server.
 # --------------------------------------------------------------------------- #
 @legacy_bp.get("/users")
+@login_required
 def legacy_get_users() -> Any:
     """Legacy ``GET /users``: list users with their record counts.
 
     Backward-compatible body (old server grouped ``mood_entries``; we group
     ``day_entries``): ``[{"user": <username>, "records": <n>}, ...]``.
+    D6 isolation: an admin sees every user, a non-admin only themselves.
     """
+    viewer = current_user()
     store = _store()
     conn = store.connect()
-    rows = conn.execute(
-        "SELECT user, COUNT(*) AS records FROM day_entries GROUP BY user ORDER BY user"
-    ).fetchall()
+    if bool(viewer.get("is_admin")):
+        rows = conn.execute(
+            "SELECT u.username AS user, "
+            "       (SELECT COUNT(*) FROM day_entries d "
+            "         WHERE d.user = u.username) AS records "
+            "FROM users u ORDER BY u.username"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT u.username AS user, "
+            "       (SELECT COUNT(*) FROM day_entries d "
+            "         WHERE d.user = u.username) AS records "
+            "FROM users u WHERE u.username = ? ORDER BY u.username",
+            (viewer["username"],),
+        ).fetchall()
     return jsonify([{"user": row["user"], "records": row["records"]} for row in rows])
 
 
 @legacy_bp.get("/moods")
+@login_required
 def legacy_get_moods() -> Any:
     """Legacy ``GET /moods``: filtered mood list with the OLD dict keys.
 
     Keys are kept exactly as the old server: ``date, time, mood, activities,
     note_title, note``. If ``user`` is missing the old server would fail on a
-    ``None`` query parameter — here we return a clear 400 instead.
+    ``None`` query parameter — here we return a clear 400 instead. D6: a
+    non-admin may only query their own username (403 otherwise).
 
     Query params: user (required), start_date, end_date (YYYY-MM-DD, inclusive).
     """
+    viewer = current_user()
     user = request.args.get("user")
     if not user:
         return jsonify({"error": "user parameter is required", "type": "bad_request"}), 400
+    if user != viewer["username"] and not bool(viewer.get("is_admin")):
+        abort(403, description="cannot access another user's data")
     start_date = request.args.get("start_date")
     end_date = request.args.get("end_date")
     if not _valid_date(start_date) or not _valid_date(end_date):
@@ -371,8 +440,6 @@ def legacy_get_moods() -> Any:
     for row in rows:
         activities = row["activities"]
         if isinstance(activities, str):
-            import json
-
             try:
                 activities = json.loads(activities)
             except ValueError:
@@ -429,11 +496,13 @@ def _error_internal(exc: Any) -> Any:
 # Fase 4: parametric records API (R2/D10)
 # --------------------------------------------------------------------------- #
 @bp.get("/records")
+@login_required
 def api_records() -> Any:
     """Return daily records with filters, column selection and pagination.
 
     Query params:
-        user: record owner (default: single YAML user or ``"default"``).
+        user: record owner (D6 isolation: admin may pick any user, a
+            non-admin viewer defaults to — and is limited to — themselves).
         start_date / end_date: inclusive ``YYYY-MM-DD`` bounds.
         columns: comma-separated allow-list of column names (from
             ``columns_config`` plus the canonical extras e.g. ``mood_label``,
@@ -447,7 +516,7 @@ def api_records() -> Any:
     truth (D4).
     """
     args = request.args
-    user = _resolve_user()
+    user = _effective_user()
     start_date = args.get("start_date")
     end_date = args.get("end_date")
 
@@ -529,14 +598,16 @@ def api_records() -> Any:
 
 
 @bp.get("/records/<full_date>")
+@login_required
 def api_record_by_date(full_date: str) -> Any:
     """Return the single canonical record for ``(user, full_date)``.
 
-    Query param user defaults like ``/api/records``. Returns a uniform 404
+    Query param user defaults like ``/api/records`` (D6 isolation: non-admin
+    viewers are limited to their own username). Returns a uniform 404
     (``{"error": "not_found", "type": "not_found"}``) when the date has no
     record for the user.
     """
-    user = _resolve_user()
+    user = _effective_user()
     if not _valid_date(full_date):
         return (
             jsonify({"error": "invalid date format (expected YYYY-MM-DD)", "type": "bad_request"}),
@@ -554,17 +625,24 @@ def api_record_by_date(full_date: str) -> Any:
 
 
 @bp.get("/import/jobs")
+@login_required
 def api_import_jobs() -> Any:
     """Return the ``import_jobs`` audit trail (most recent first).
 
     Query params:
-        user: optional owner filter.
+        user: optional owner filter (D6: a non-admin viewer is limited to
+            their own username and cannot filter another user's jobs).
         limit: optional row cap (default 100, 1..1000).
 
     Response: ``{"jobs": [...]}`` where each job mirrors the §5.3 audit row
     (detail parsed to a JSON array, timestamps as ISO strings).
     """
+    viewer = current_user()
     user = request.args.get("user") or None
+    if user and user != viewer["username"] and not bool(viewer.get("is_admin")):
+        abort(403, description="cannot access another user's data")
+    if user is None and not bool(viewer.get("is_admin")):
+        user = viewer["username"]
     try:
         limit = int(request.args.get("limit") or 100)
     except ValueError:
@@ -577,3 +655,182 @@ def api_import_jobs() -> Any:
     store = _store()
     conn = store.connect()
     return jsonify({"jobs": list_jobs(conn, user=user, limit=limit)})
+
+
+# --------------------------------------------------------------------------- #
+# Fase 5: user listing, upload and per-user folder import (R6/R7)
+# --------------------------------------------------------------------------- #
+@bp.get("/users")
+@login_required
+def api_users() -> Any:
+    """Return the user list (WORKPLAN §5.6).
+
+    D6 isolation: an admin sees every user (with record counts), a non-admin
+    viewer sees only their own identity. Response: ``{"users": [...]}`` where
+    every entry mirrors the public user shape (no password data).
+    """
+    viewer = current_user()
+    conn = _store().connect()
+    if bool(viewer.get("is_admin")):
+        users = [public_user_with_records(row) for row in list_users_with_counts(conn)]
+    else:
+        own = conn.execute(
+            "SELECT u.id, u.username, u.is_admin, u.import_dir, u.created_at, "
+            "       u.updated_at, "
+            "       (SELECT COUNT(*) FROM day_entries d WHERE d.user = u.username) "
+            "       AS records "
+            "FROM users u WHERE u.username = ?",
+            (viewer["username"],),
+        ).fetchone()
+        users = [public_user_with_records(dict(own))] if own is not None else []
+    return jsonify({"users": users}), 200
+
+
+def _import_dir_for(username: str) -> str | None:
+    """Resolve the per-user import folder: YAML override, then the users row."""
+    cfg = current_app.config.get("DAYLIO")
+    if cfg is not None:
+        overrides = cfg.users.get(username)
+        if isinstance(overrides, dict) and overrides.get("import_dir"):
+            return str(overrides["import_dir"])
+    row = _store().connect().execute(
+        "SELECT import_dir FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    if row is not None and row["import_dir"]:
+        return str(row["import_dir"])
+    return None
+
+
+@bp.post("/import")
+@login_required
+def api_import_upload() -> Any:
+    """Upload a CSV/.daylio export and persist it (Task 5.3, R7a).
+
+    Multipart form: ``file`` (required). Optional ``user`` selects the target
+    owner for an admin; a non-admin always imports into their own account.
+
+    Response 200: ``{"job": <ImportSummary dict>}`` with the audit counters and
+    the ``job_id``. Unsupported extensions / missing ``file`` / unrecognized
+    magic bytes produce a uniform 400; a parse/import failure still records a
+    ``status="failed"`` audit row (every import leaves a trail).
+    """
+    viewer = current_user()
+    requested = (request.form.get("user") or "").strip()
+    if requested:
+        if requested != viewer["username"] and not bool(viewer.get("is_admin")):
+            abort(403, description="cannot import into another user's data")
+        target = requested
+    else:
+        target = str(viewer["username"])
+
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return (
+            jsonify({"error": "multipart field 'file' is required", "type": "bad_request"}),
+            400,
+        )
+    filename = Path(uploaded.filename).name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".csv", ".daylio"}:
+        return (
+            jsonify(
+                {
+                    "error": "unsupported file type (expected .csv or .daylio)",
+                    "type": "bad_request",
+                }
+            ),
+            400,
+        )
+
+    store = _store()
+    conn = store.connect()
+    cfg = current_app.config.get("DAYLIO")
+
+    # Stream the upload to a temp file so the importers can read magic bytes /
+    # reparse the archive exactly like a filesystem folder scan.
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+        uploaded.save(tmp_path)
+    try:
+        fmt = detect_format(tmp_path)
+        if fmt == FORMAT_CSV:
+            result = parse_csv(tmp_path, cfg)
+        elif fmt == FORMAT_DAYLIO:
+            result = parse_daylio(tmp_path, cfg)
+        else:
+            # B1: an unrecognized-format upload is a clean 400, but it must
+            # still leave a failed audit row ("every import leaves a trail").
+            _failed_import_summary(
+                conn,
+                target,
+                "upload",
+                filename,
+                "format",
+                f"unrecognized file format: {filename}",
+            )
+            return (
+                jsonify({"error": "unrecognized file format", "type": "bad_request"}),
+                400,
+            )
+    except (ValueError, csv.Error) as exc:
+        # B2/R1: a parse failure (a text CSV missing the mandatory
+        # 'full_date' column, or a field over csv.field_size_limit) is a clean
+        # 400 with a failed audit row, mirroring the folder-scan tolerance
+        # (_import_one_file). ``csv.Error`` does not subclass ValueError, so it
+        # must be listed explicitly; a broad ``except Exception`` would also
+        # mask genuine DB bugs as client errors.
+        _failed_import_summary(conn, target, "upload", filename, "parse", str(exc))
+        return jsonify({"error": str(exc), "type": "bad_request"}), 400
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    summary = import_data(conn, _influx(), cfg, target, "upload", filename, result)
+    return jsonify({"job": summary.to_dict()}), 200
+
+
+@bp.post("/import/folder")
+@login_required
+def api_import_folder() -> Any:
+    """Trigger a scan of the per-user import folder (Task 5.4, R7a).
+
+    Each CSV/.daylio file in the folder is imported and moved to
+    ``done/`` (completed) or ``failed/`` (failed). The folder is resolved via
+    the optional ``import_dir`` form/query param, then the YAML per-user
+    override, then the ``users.import_dir`` row. An admin may trigger another
+    user's folder with ``user=<name>``; a non-admin always uses their own.
+
+    Response 200: ``{"imports": [<ImportSummary dict with moved_to>, ...]}``.
+    """
+    viewer = current_user()
+    requested = ((request.form.get("user") or request.args.get("user")) or "").strip()
+    if requested:
+        if requested != viewer["username"] and not bool(viewer.get("is_admin")):
+            abort(403, description="cannot access another user's data")
+        target = requested
+    else:
+        target = str(viewer["username"])
+
+    folder = ((request.form.get("import_dir") or request.args.get("import_dir")) or "").strip()
+    if not folder:
+        folder = _import_dir_for(target) or ""
+    if not folder:
+        return (
+            jsonify(
+                {
+                    "error": f"import_dir is not configured for user {target!r}",
+                    "type": "bad_request",
+                }
+            ),
+            400,
+        )
+
+    try:
+        results = import_folder(
+            _store().connect(), _influx(), current_app.config.get("DAYLIO"),
+            target, folder, source="folder",
+        )
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc), "type": "bad_request"}), 400
+    return jsonify({"imports": results}), 200

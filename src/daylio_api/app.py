@@ -24,19 +24,24 @@ Fail-fast : invalid configuration raises ``ConfigError`` from ``create_app``,
 from __future__ import annotations
 
 import os
+import secrets
+from datetime import timedelta
 from typing import Any
 
 from flask import Flask, jsonify, request
 
 from daylio_api import __version__
+from daylio_api.api.auth import admin_bp, auth_bp, init_admin
 from daylio_api.api.routes import bp as api_bp
 from daylio_api.api.routes import legacy_bp
 from daylio_api.config import AppConfig, sync_schema
 from daylio_api.config import load as load_config
+from daylio_api.db.influx_store import InfluxStore, resolve_influx_config
 from daylio_api.db.migrations import migrate
 from daylio_api.db.sqlite_store import SqliteStore
 from daylio_api.logger import configure as configure_logger
 from daylio_api.logger import get_logger
+from daylio_api.scheduler import create_scheduler
 
 log = get_logger("app")
 
@@ -86,11 +91,71 @@ def create_app(
         sync_stats,
     )
 
+    # --- Auth (Fase 5, D6): signed sessions + API keys --------------------- #
+    # SECRET_KEY drives the itsdangerous session signature. A missing
+    # auth.session_secret (or an unresolved ``env:SESSION_SECRET`` placeholder)
+    # falls back to a random per-boot secret with a loud warning: sessions
+    # will not survive a restart, but the service stays bootable.
+    auth_cfg = cfg.auth if isinstance(cfg.auth, dict) else {}
+    session_secret = str(auth_cfg.get("session_secret") or "").strip()
+    if not session_secret or session_secret.startswith("env:"):
+        log.warning(
+            "auth.session_secret is not configured; using a random per-boot "
+            "secret (sessions will not survive a restart)"
+        )
+        session_secret = secrets.token_hex(32)
+    app.config["SECRET_KEY"] = session_secret
+    session_ttl = auth_cfg.get("session_ttl")
+    session_ttl = int(session_ttl) if isinstance(session_ttl, int) else 86400
+    app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(seconds=session_ttl)
+    app.config["SESSION_COOKIE_NAME"] = str(
+        auth_cfg.get("session_cookie_name") or "daylio_session"
+    )
+    api_keys_cfg = auth_cfg.get("api_keys")
+    app.config["DAYLIO_API_KEYS_ENABLED"] = bool(
+        api_keys_cfg.get("enabled", True)
+        if isinstance(api_keys_cfg, dict)
+        else True
+    )
+
+    # First-boot admin bootstrap (D6): ADMIN_USERNAME/ADMIN_PASSWORD env.
+    try:
+        init_admin(store, cfg)
+    except Exception:  # noqa: BLE001 — admin bootstrap must never block boot
+        log.exception("admin bootstrap failed; continuing without an admin user")
+
+    # --- InfluxDB store (lazy client; R8: unavailable is not fatal) --------- #
+    influx: InfluxStore | None = None
+    influx_cfg = resolve_influx_config(cfg)
+    if influx_cfg is not None:
+        influx = InfluxStore(influx_cfg)
+    app.extensions["daylio_influx"] = influx
+
     # REST API blueprint (Fase 1: version + configuration reads; more in Phases 4-5).
     app.register_blueprint(api_bp)
     # Root-level legacy endpoints (old server.py wire contract, read from
     # day_entries/users). Registered behind the API blueprint on purpose.
     app.register_blueprint(legacy_bp)
+    # Fase 5: authentication + admin-only user management (D6).
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(admin_bp)
+
+    # --- Per-user folder import scheduler (Fase 5, R7/D6) ------------------- #
+    # Registered ONLY when scheduler.enabled is true (opt-in). A scheduler
+    # failure is logged and never prevents the app from serving.
+    scheduler_enabled = bool((cfg.scheduler or {}).get("enabled", False))
+    if scheduler_enabled:
+        try:
+            scheduler = create_scheduler(store, influx, cfg)
+            scheduler.start()
+            app.extensions["daylio_scheduler"] = scheduler
+            log.info("APScheduler started (%d jobs)", len(scheduler.get_jobs()))
+        except Exception:  # noqa: BLE001 — scheduler must never block boot
+            log.exception("APScheduler failed to start; continuing without it")
+            app.extensions["daylio_scheduler"] = None
+    else:
+        app.extensions["daylio_scheduler"] = None
+        log.info("scheduler.enabled=false: periodic imports are OFF (Fase 5)")
 
     # Minimal liveness endpoint for smoke tests / orchestration.
     @app.get("/healthz")
@@ -116,6 +181,19 @@ def create_app(
             f"<body><h1>Not Found</h1><p>{message}</p></body></html>"
         )
         return body, 404, {"Content-Type": "text/html"}
+
+    # Fase 5 auth errors use the uniform JSON shape. They are registered
+    # app-wide so decorators in any blueprint (api, legacy, auth, admin)
+    # produce the same 401/403 wire contract.
+    @app.errorhandler(401)
+    def _unauthorized(exc: Any) -> Any:
+        message = str(getattr(exc, "description", None) or "authentication required")
+        return jsonify({"error": message, "type": "unauthorized"}), 401
+
+    @app.errorhandler(403)
+    def _forbidden(exc: Any) -> Any:
+        message = str(getattr(exc, "description", None) or "forbidden")
+        return jsonify({"error": message, "type": "forbidden"}), 403
 
     log.info("Flask app created (version=%s)", __version__)
     return app

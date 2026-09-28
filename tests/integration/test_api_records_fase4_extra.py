@@ -22,6 +22,7 @@ import pytest
 from daylio_api.api import routes as routes_mod
 from daylio_api.api.routes import _CANONICAL_EXTRA_COLUMNS
 from daylio_api.app import create_app
+from tests.helpers import login_assert_ok
 from tests.integration.test_api_records import SEED_END, SEED_START, _seed_sample
 
 
@@ -33,7 +34,10 @@ def api_client(tmp_path: Path, monkeypatch, sample_csv, config_sample):
     monkeypatch.setenv("DB_PATH", str(tmp_db))
     app = create_app()
     app.config["TESTING"] = True
-    return app.test_client()
+    client = app.test_client()
+    # D6: the data routes require authentication; the admin may read any user.
+    login_assert_ok(client)
+    return client
 
 
 # --------------------------------------------------------------------------- #
@@ -148,6 +152,9 @@ def test_internal_error_hides_traceback(
     app.config["TESTING"] = False
     app.config["PROPAGATE_EXCEPTIONS"] = False
     client = app.test_client()
+    # D6: authenticate FIRST — login uses api.auth._store (separate from
+    # routes_mod._store); only the data route hits the patched helper.
+    login_assert_ok(client)
 
     def _boom() -> None:
         raise RuntimeError("simulated hidden failure 7f3a9")

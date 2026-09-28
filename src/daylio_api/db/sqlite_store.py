@@ -19,9 +19,17 @@ Record contract : ``upsert_entry(conn, user, entry)`` accepts a
              the normalizer's scales list + ``scala_salute``.
 
 Transaction  :  store functions are statement-oriented and do NOT commit; the
-           coordinator (``import_flow.import_data``) owns the transaction and
-           commits once at the end. The ``connect()`` method also applies the
-           versioned migrations so a store is always schema-ready on open.
+            coordinator (``import_flow.import_data``) owns the transaction and
+            commits once at the end. The ``connect()`` method also applies the
+            versioned migrations so a store is always schema-ready on open.
+
+Threading   :  **one sqlite3 connection per thread** (B3 fix). ``connect()``
+            returns the calling thread's dedicated connection; sqlite3
+            connections are bound to the creating thread (check_same_thread),
+            so sharing a single cached connection across Waitress worker
+            threads raised ``sqlite3.ProgrammingError``. ``close()`` closes
+            every connection opened by the store (registry) and clears the
+            current thread's cached handle.
 ==================================================================================
 """
 
@@ -29,6 +37,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -59,26 +68,45 @@ class SqliteStore:
 
     def __init__(self, db_path: str | Path = "data/daylio.db") -> None:
         self.db_path = Path(db_path)
-        self._conn: sqlite3.Connection | None = None
+        # Per-thread connections (B3): each thread owns the sqlite3 connection
+        # it created. Using a single cached connection across Waitress worker
+        # threads raised sqlite3.ProgrammingError (check_same_thread), so the
+        # store tracks ONE connection per thread plus a registry of every open
+        # connection for clean shutdown via close().
+        self._local = threading.local()
+        self._open: set[sqlite3.Connection] = set()
+        self._open_lock = threading.Lock()
 
     def connect(self) -> sqlite3.Connection:
-        """Open (or reuse) a SQLite connection, creating parent dirs.
+        """Return the calling thread's dedicated SQLite connection.
 
-        Also applies the versioned, idempotent migrations so a freshly opened
-        store is always schema-ready (Fase 3: users/day_entries/import_jobs).
+        The connection is created lazily on first use in the current thread,
+        creating parent dirs and applying the versioned, idempotent migrations
+        so a freshly opened store is always schema-ready (Fase 3:
+        users/day_entries/import_jobs; Fase 5: api_keys).
+
+        Two threads may briefly apply migrations concurrently on their first
+        connect; the DDL is ``IF NOT EXISTS``-idempotent and SQLite serializes
+        writes, so that is safe.
         """
-        if self._conn is not None:
-            return self._conn
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            return conn
         if self.db_path.parent != Path("."):
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        log.debug("SQLite connected: %s", self.db_path)
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        with self._open_lock:
+            self._open.add(conn)
+        self._local.conn = conn
+        log.debug(
+            "SQLite connected (thread=%s): %s", threading.get_ident(), self.db_path
+        )
         from daylio_api.db.migrations import migrate as apply_migrations
 
-        apply_migrations(self._conn)
-        return self._conn
+        apply_migrations(conn)
+        return conn
 
     def migrate(self) -> int:
         """Apply versioned, idempotent migrations and return the schema version.
@@ -90,10 +118,25 @@ class SqliteStore:
         return apply_migrations(self.connect())
 
     def close(self) -> None:
-        """Close the underlying connection if open."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """Close every connection opened by this store (any thread).
+
+        Idempotent and safe for teardown/shutdown; must not be called while
+        another thread is mid-request. Also clears the calling thread's cached
+        handle so a later ``connect()`` reopens a fresh connection.
+        """
+        with self._open_lock:
+            conns = list(self._open)
+            self._open.clear()
+        for conn in conns:
+            try:
+                conn.close()
+            except sqlite3.ProgrammingError:
+                pass
+        if hasattr(self._local, "conn"):
+            try:
+                del self._local.conn
+            except AttributeError:
+                pass
 
     def __enter__(self) -> SqliteStore:
         self.connect()
@@ -365,7 +408,7 @@ def count_entries(conn: sqlite3.Connection, user: str) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Minimal users helpers (structure only — real auth lands in Phase 5)
+# Users helpers (structure since Phase 3; real auth lands in Phase 5)
 # --------------------------------------------------------------------------- #
 def get_or_create_user(
     conn: sqlite3.Connection,
@@ -405,3 +448,159 @@ def list_users(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "FROM users ORDER BY username"
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def user_by_username(conn: sqlite3.Connection, username: str) -> dict[str, Any] | None:
+    """Return the full ``users`` row for ``username`` (password_hash included).
+
+    Phase 5 auth uses this to verify passwords and resolve the authenticated
+    identity. ``None`` when the user does not exist.
+    """
+    row = conn.execute(
+        "SELECT id, username, password_hash, is_admin, import_dir, "
+        "created_at, updated_at FROM users WHERE username = ?",
+        (username,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def create_user(
+    conn: sqlite3.Connection,
+    username: str,
+    *,
+    password_hash: str = "",
+    is_admin: bool = False,
+    import_dir: str | None = None,
+) -> int:
+    """Create a ``users`` row and return its id.
+
+    Raises:
+        sqlite3.IntegrityError: when ``username`` already exists (the caller
+            translates it into the admin API 409 response).
+    """
+    cursor = conn.execute(
+        "INSERT INTO users (username, password_hash, is_admin, import_dir) "
+        "VALUES (?, ?, ?, ?)",
+        (username, password_hash, int(bool(is_admin)), import_dir),
+    )
+    return int(cursor.lastrowid)
+
+
+def update_user_password(
+    conn: sqlite3.Connection, username: str, password_hash: str
+) -> None:
+    """Set the PBKDF2 ``password_hash`` for ``username`` (Phase 5 auth)."""
+    conn.execute(
+        "UPDATE users SET password_hash = ?, updated_at = datetime('now') "
+        "WHERE username = ?",
+        (password_hash, username),
+    )
+
+
+def delete_user(conn: sqlite3.Connection, username: str) -> int:
+    """Delete a user and every owned row (records, audit, keys, config).
+
+    Ownership is removed in FK-safe order: ``api_keys`` (by ``user_id``),
+    ``import_jobs``/``day_entries`` (by ``user``), per-user ``columns_config``/
+    ``scales_config`` (by ``user_id``), then the ``users`` row itself.
+
+    Returns:
+        The number of deleted ``users`` rows (0 when the user did not exist).
+    """
+    row = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if row is None:
+        return 0
+    user_id = int(row["id"])
+    conn.execute("DELETE FROM api_keys WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM import_jobs WHERE user = ?", (username,))
+    conn.execute("DELETE FROM day_entries WHERE user = ?", (username,))
+    conn.execute("DELETE FROM columns_config WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM scales_config WHERE user_id = ?", (user_id,))
+    cursor = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    return int(cursor.rowcount)
+
+
+def list_users_with_counts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return ``users`` rows joined with their day_entries record counts."""
+    rows = conn.execute(
+        "SELECT u.id, u.username, u.is_admin, u.import_dir, u.created_at, "
+        "       u.updated_at, "
+        "       (SELECT COUNT(*) FROM day_entries d WHERE d.user = u.username) AS records "
+        "FROM users u ORDER BY u.username"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+# --------------------------------------------------------------------------- #
+# API keys (Fase 5, D6) — only the SHA-256 hash is stored, never the secret
+# --------------------------------------------------------------------------- #
+def create_api_key(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    key_prefix: str,
+    key_hash: str,
+    name: str = "",
+) -> int:
+    """Insert an API key descriptor and return its id.
+
+    Args:
+        conn: SQLite connection.
+        user_id: owning ``users.id``.
+        key_prefix: display prefix (first chars of the plaintext key).
+        key_hash: SHA-256 hex digest of the full plaintext key (never stored
+            in plaintext).
+        name: optional human-readable label for the key.
+    """
+    cursor = conn.execute(
+        "INSERT INTO api_keys (user_id, key_prefix, key_hash, name) "
+        "VALUES (?, ?, ?, ?)",
+        (user_id, key_prefix, key_hash, str(name or "")),
+    )
+    return int(cursor.lastrowid)
+
+
+def list_api_keys(
+    conn: sqlite3.Connection, user_id: int, *, include_revoked: bool = False
+) -> list[dict[str, Any]]:
+    """Return (optionally revoked) API key descriptors for ``user_id``."""
+    sql = (
+        "SELECT id, key_prefix, name, created_at, last_used_at, revoked "
+        "FROM api_keys WHERE user_id = ?"
+    )
+    params: list[Any] = [user_id]
+    if not include_revoked:
+        sql += " AND revoked = 0"
+    sql += " ORDER BY id"
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def revoke_api_key(conn: sqlite3.Connection, user_id: int, key_prefix: str) -> int:
+    """Soft-revoke an API key; returns the number of affected rows."""
+    cursor = conn.execute(
+        "UPDATE api_keys SET revoked = 1 WHERE user_id = ? AND key_prefix = ?",
+        (user_id, key_prefix),
+    )
+    return int(cursor.rowcount)
+
+
+def user_for_api_key(conn: sqlite3.Connection, key_hash: str) -> dict[str, Any] | None:
+    """Resolve an API key hash to its active user row (or None).
+
+    Only non-revoked keys authenticate. A match also bumps ``last_used_at``.
+    """
+    row = conn.execute(
+        "SELECT a.id AS key_id, a.user_id, u.username, u.is_admin, u.import_dir, "
+        "       u.created_at, u.updated_at "
+        "FROM api_keys a JOIN users u ON u.id = a.user_id "
+        "WHERE a.key_hash = ? AND a.revoked = 0",
+        (key_hash,),
+    ).fetchone()
+    if row is None:
+        return None
+    user = dict(row)
+    conn.execute(
+        "UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?",
+        (int(user["key_id"]),),
+    )
+    return user
