@@ -12,7 +12,8 @@ Coverage (WORKPLAN §7 FASE 4 / Task 4.4):
   - GET /api/records/<full_date> -> canonical record incl. scales/scala_salute
     and 404 for a missing date;
   - GET /api/import/jobs -> at least one job after an import;
-  - legacy GET /users and GET /moods with the EXACT old dict keys.
+  - legacy GET /users and GET /moods with the EXACT old dict keys;
+  - ``?user=`` empty/blank falling back to the viewer (BUG-2 fix, QA round 2).
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from daylio_api.app import create_app
-from daylio_api.db.sqlite_store import SqliteStore
+from daylio_api.db.sqlite_store import SqliteStore, upsert_entry
 from daylio_api.import_flow import import_data
 from daylio_api.importers.csv_importer import parse_csv
 from daylio_api.importers.normalizer import normalize
@@ -64,14 +65,20 @@ def _seed_sample(tmp_db: Path, sample_csv, config_sample) -> None:
 
 
 @pytest.fixture
-def api_client(tmp_path: Path, monkeypatch, sample_csv, config_sample):
-    """Flask test client backed by a freshly seeded temp SQLite database."""
+def api_app(tmp_path: Path, monkeypatch, sample_csv, config_sample):
+    """Flask app backed by a freshly seeded temp SQLite database (no client)."""
     tmp_db = tmp_path / "api_records_test.db"
     _seed_sample(tmp_db, sample_csv, config_sample)
     monkeypatch.setenv("DB_PATH", str(tmp_db))
     app = create_app()
     app.config["TESTING"] = True
-    client = app.test_client()
+    return app
+
+
+@pytest.fixture
+def api_client(api_app):
+    """Flask test client logged in as the boot admin (D6)."""
+    client = api_app.test_client()
     # D6: the data routes require authentication; the admin may read any user.
     login_assert_ok(client)
     return client
@@ -80,6 +87,56 @@ def api_client(tmp_path: Path, monkeypatch, sample_csv, config_sample):
 # --------------------------------------------------------------------------- #
 # GET /api/records — basic + column selection
 # --------------------------------------------------------------------------- #
+def test_records_empty_user_param_falls_back_to_the_viewer(api_app) -> None:
+    """``?user=`` (empty/blank) means "no filter", not the empty username.
+
+    Regression test for the shared ``_effective_user`` (BUG-2, QA round 2): an
+    explicit empty value used to resolve the scope to ``""`` and answer 200
+    with zero rows even for an admin asking for its own data.
+
+    ``api_client`` seeds the 20-day subset for the legacy ``default`` user
+    only, so this test owns its app to add a row for the authenticated viewer.
+    The canonical record has no ``user`` key, so the resolved scope is observed
+    through WHICH rows come back.
+    """
+    conn = api_app.extensions["daylio_store"].connect()
+    upsert_entry(
+        conn,
+        "admin",
+        {
+            "full_date": "2026-08-10",
+            "date": "10 agosto",
+            "weekday": "lunedì",
+            "time": "21:00",
+            "mood": 2,
+            "mood_label": "bene",
+            "activities": ["corsa"],
+            "scales": {},
+            "note_title": "",
+            "note": "",
+            "source": "csv",
+        },
+    )
+    conn.commit()
+    client = api_app.test_client()
+    login_assert_ok(client)
+
+    expected = client.get("/api/records").get_json()
+    assert expected["total"] == 1
+    assert expected["records"][0]["full_date"] == "2026-08-10"
+
+    for query in ("user=", "user=%20", "user=%20%20"):
+        payload = client.get(f"/api/records?{query}").get_json()
+        # total 1 (not 0): the scope is the viewer, NOT the empty username.
+        assert payload["total"] == 1, query
+        assert payload["records"][0]["full_date"] == "2026-08-10", query
+
+    # An explicit other username is still honoured (the admin may read anyone):
+    # ``default`` keeps its 20 seeded rows, ``ghost`` has none.
+    assert client.get("/api/records?user=default").get_json()["total"] == SEED_COUNT
+    assert client.get("/api/records?user=ghost").get_json()["total"] == 0
+
+
 def test_records_basic_canonical_shape(api_client) -> None:
     """GET /api/records -> total 20, canonical keys, full_date DESC order."""
     resp = api_client.get("/api/records?user=default")

@@ -4,11 +4,126 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Daylio API Server — Dashboard</title>
+  <!--
+    MAINTENANCE NOTES (Fase 6, WORKPLAN §5.7 / R4):
+      - Chart.js is VENDORED (no third-party CDN at runtime, D13/R10):
+        /dashboard/static/vendor/chart.umd.min.js — Chart.js v4.5.1 (MIT).
+        Replace the file (same name) to upgrade; the API used by app.js is the
+        stable v4 core (Chart / registerables).
+      - The page is a static shell: every datum comes from /api/analytics/*
+        (InfluxDB only, R4/D4). No build step, no bundler, no framework.
+      - All asset URLs are ABSOLUTE because the page is served both at
+        /dashboard and /dashboard/ (relative URLs would resolve differently).
+  -->
+  <link rel="stylesheet" href="/dashboard/static/app.css">
 </head>
 <body>
-  <h1>Daylio API Server</h1>
-  <p>Placeholder dashboard. The Chart.js SPA reading exclusively from InfluxDB
-     (R4 / D4) ships in Phase 6 — see docs/WORKPLAN.md.</p>
-  <p>API health checks: <a href="/healthz">/healthz</a>, <a href="/api/version">/api/version</a></p>
+  <!-- Login form: shown when GET /api/auth/me answers 401. -->
+  <section id="login-view" class="view hidden">
+    <form id="login-form" class="card login-card" autocomplete="on">
+      <h1>Daylio API Server</h1>
+      <p class="muted">Sign in to load the InfluxDB dashboard.</p>
+      <label for="login-username">Username</label>
+      <input id="login-username" name="username" type="text" required autofocus>
+      <label for="login-password">Password</label>
+      <input id="login-password" name="password" type="password" required>
+      <button type="submit">Sign in</button>
+      <p id="login-error" class="error hidden" role="alert"></p>
+    </form>
+  </section>
+
+  <!-- Dashboard: shown when a session (or API key) is authenticated. -->
+  <section id="dashboard-view" class="view hidden">
+    <header class="topbar">
+      <h1>Daylio dashboard</h1>
+      <div class="topbar-right">
+        <span id="current-user" class="badge">—</span>
+        <span id="influx-status" class="badge badge-muted">InfluxDB: checking…</span>
+        <button id="logout-button" type="button" class="secondary">Log out</button>
+      </div>
+    </header>
+
+    <p class="muted small">
+      Every chart below is served by <code>/api/analytics/*</code>, which reads
+      <strong>InfluxDB only</strong> (R4/D4). There is no SQL fallback.
+    </p>
+
+    <!-- Filters: date range + (admin only) user scope. -->
+    <form id="filters-form" class="card filters">
+      <div class="field">
+        <label for="start-date">From</label>
+        <input id="start-date" type="date">
+      </div>
+      <div class="field">
+        <label for="end-date">To</label>
+        <input id="end-date" type="date">
+      </div>
+      <div class="field">
+        <label for="granularity">Group by</label>
+        <select id="granularity">
+          <option value="auto">auto</option>
+          <option value="day">day</option>
+          <option value="week">week</option>
+        </select>
+      </div>
+      <div class="field hidden" id="user-field">
+        <label for="user-select">User</label>
+        <select id="user-select"></select>
+      </div>
+      <div class="field">
+        <label for="quick-range">Quick range</label>
+        <select id="quick-range">
+          <option value="30">last 30 days</option>
+          <option value="92" selected>last 92 days</option>
+          <option value="365">last year</option>
+          <option value="all">all data</option>
+        </select>
+      </div>
+      <button type="submit" id="refresh-button">Refresh</button>
+    </form>
+
+    <!-- Global status banner: 503 (InfluxDB down) / load errors land here. -->
+    <p id="status-banner" class="banner hidden" role="status"></p>
+
+    <div class="grid">
+      <section class="card chart-card wide">
+        <h2>Mood over time <span id="mood-over-time-hint" class="muted small"></span></h2>
+        <div class="chart-box"><canvas id="chart-mood-over-time"></canvas></div>
+      </section>
+
+      <section class="card chart-card">
+        <h2>Mood distribution</h2>
+        <div class="chart-box"><canvas id="chart-mood-distribution"></canvas></div>
+      </section>
+
+      <section class="card chart-card">
+        <h2>Top activities</h2>
+        <div class="chart-box"><canvas id="chart-activities-top"></canvas></div>
+      </section>
+
+      <section class="card chart-card wide">
+        <h2>Scales trend <span id="scales-trend-hint" class="muted small"></span></h2>
+        <div id="scales-trend-charts" class="scales-grid"></div>
+      </section>
+
+      <section class="card chart-card wide">
+        <h2>Mood heatmap <span class="muted small">weekday × hour</span></h2>
+        <p class="muted small">
+          Minimum custom matrix (no extra dependency): rows are weekdays
+          (Monday first), columns are hours of the point timestamp.
+        </p>
+        <div id="heatmap" class="heatmap-scroll"></div>
+        <p id="heatmap-legend" class="muted small"></p>
+      </section>
+    </div>
+
+    <footer class="muted small">
+      Health: <a href="/healthz">/healthz</a> · API: <a href="/api/version">/api/version</a>
+    </footer>
+  </section>
+
+  <!-- Chart.js v4.5.1 (vendored, MIT) then the dashboard app. -->
+  <script src="/dashboard/static/vendor/chart.umd.min.js"></script>
+  <script src="/dashboard/static/app.js"></script>
 </body>
 </html>

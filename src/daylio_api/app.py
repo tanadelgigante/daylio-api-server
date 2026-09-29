@@ -8,23 +8,35 @@ Scope    : Fase 0 (Task 0.2/0.4) + Fase 1 (Tasks 1.1/1.2/1.3) — creates the Fl
            versioned idempotent migrations (db.migrations) and reconciles the
            columns/scales/mood configuration with the YAML (config.sync_schema),
            then registers the ``/api`` blueprint (version + config reads).
-           Records/import/auth/dashboard blueprints arrive in Phases 4-6.
+           Fase 4/5 add the records/import/auth blueprints, Fase 6 the
+           ``dashboard`` blueprint (``/dashboard`` SPA + ``/api/analytics/*``,
+           Influx-only, R4/D4).
 
 Lifecycle: the SqliteStore is stored in ``app.extensions["daylio_store"]`` and
-           lives for the whole app lifetime (call ``.close()`` on shutdown, as
-           the tests do). The module-level ``app`` WSGI object boots the schema
-           at import time — the normal behaviour under Waitress
-           (``waitress-serve --port=5000 daylio_api.app:app``).
+           lives for the whole app lifetime. Every ``create_app()`` registers an
+           ``atexit`` hook that closes BOTH stores (R3: the SQLite connections
+           were previously never released) — see :func:`_make_shutdown`.
+
+WSGI      : the module-level ``app`` is a :class:`_LazyWsgiApp` proxy that calls
+           ``create_app()`` on the FIRST request instead of at import time
+           (R2: importing the module used to create ``data/daylio.db`` as a side
+           effect, ignoring the ``DB_PATH`` override a test had just set). It is
+           a plain WSGI callable, so ``waitress-serve daylio_api.app:app`` (the
+           Docker CMD) is unaffected; attribute access is proxied to the real
+           Flask app, so ``app.test_client()``/``app.config`` keep working.
 
 Fail-fast : invalid configuration raises ``ConfigError`` from ``create_app``,
            so a misconfigured service never starts (risk R15).
-==================================================================================
+================================================================================
 """
 
 from __future__ import annotations
 
+import atexit
 import os
 import secrets
+import threading
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
@@ -36,6 +48,7 @@ from daylio_api.api.routes import bp as api_bp
 from daylio_api.api.routes import legacy_bp
 from daylio_api.config import AppConfig, sync_schema
 from daylio_api.config import load as load_config
+from daylio_api.dashboard.views import bp as dashboard_bp
 from daylio_api.db.influx_store import InfluxStore, resolve_influx_config
 from daylio_api.db.migrations import migrate
 from daylio_api.db.sqlite_store import SqliteStore
@@ -44,6 +57,40 @@ from daylio_api.logger import get_logger
 from daylio_api.scheduler import create_scheduler
 
 log = get_logger("app")
+
+
+def _make_shutdown(store: SqliteStore, influx: InfluxStore | None) -> Callable[[], None]:
+    """Return the idempotent shutdown hook closing the SQLite+Influx stores.
+
+    R3: ``SqliteStore`` keeps one connection per thread and no caller closed
+    them, so the interpreter exit leaked every connection. Failures are logged
+    and never raised: a shutdown hook must not break the exit path. The hook is
+    safe to call twice and never while a request is in flight (atexit only runs
+    after the WSGI server has stopped).
+    """
+    closed = False
+
+    def _shutdown() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        if influx is not None:
+            try:
+                influx.close()
+            except Exception as exc:  # noqa: BLE001 — shutdown must not raise
+                log.warning("Influx client close failed: %s", exc)
+        try:
+            store.close()
+        except Exception as exc:  # noqa: BLE001 — shutdown must not raise
+            log.warning("SQLite store close failed: %s", exc)
+        # DEBUG on purpose: at interpreter exit the stdio streams may already be
+        # closed (a StreamHandler write would then emit a logging error), so the
+        # hook only reports itself when LOG_LEVEL=DEBUG.
+        log.debug("Stores closed on shutdown (R3)")
+
+    return _shutdown
+
 
 
 def create_app(
@@ -131,6 +178,10 @@ def create_app(
         influx = InfluxStore(influx_cfg)
     app.extensions["daylio_influx"] = influx
 
+    # R3: release both stores (SQLite connections + Influx client) at exit.
+    app.extensions["daylio_shutdown"] = _make_shutdown(store, influx)
+    atexit.register(app.extensions["daylio_shutdown"])
+
     # REST API blueprint (Fase 1: version + configuration reads; more in Phases 4-5).
     app.register_blueprint(api_bp)
     # Root-level legacy endpoints (old server.py wire contract, read from
@@ -139,6 +190,8 @@ def create_app(
     # Fase 5: authentication + admin-only user management (D6).
     app.register_blueprint(auth_bp)
     app.register_blueprint(admin_bp)
+    # Fase 6: dashboard SPA + /api/analytics/* (Influx-only, R4/D4).
+    app.register_blueprint(dashboard_bp)
 
     # --- Per-user folder import scheduler (Fase 5, R7/D6) ------------------- #
     # Registered ONLY when scheduler.enabled is true (opt-in). A scheduler
@@ -166,8 +219,9 @@ def create_app(
     # Uniform 404 for UNMATCHED routes (no blueprint context -> app-level).
     # Blueprint-raised 404s keep the blueprint handler in api/routes.py (the
     # wire contract is the same); this fallback guarantees that even unknown
-    # /api/* paths answer JSON. Non-API requests without JSON in Accept (e.g.
-    # the future dashboard/static, Fase 6) fall back to a minimal HTML page.
+    # /api/* paths answer JSON. Non-API requests without JSON in Accept (the
+    # dashboard SPA shell and its static assets) fall back to a minimal HTML
+    # page.
     @app.errorhandler(404)
     def _app_not_found(exc: Any) -> Any:
         message = str(getattr(exc, "description", None) or "not found")
@@ -199,10 +253,50 @@ def create_app(
     return app
 
 
-#: WSGI entry point used by Waitress (and docker CMD). Boots the schema and
-#: seeds the config tables at import time (see MAINTENANCE NOTES above).
-app = create_app()
+#: WSGI entry point used by Waitress (and docker CMD). It is a LAZY proxy: the
+#: Flask app (and therefore the SQLite schema + config seeding) is built on the
+#: first request instead of at import time, so importing this module has no side
+#: effect on the filesystem (R2). See the module MAINTENANCE NOTES above.
+class _LazyWsgiApp:
+    """WSGI callable that builds the Flask app on first use (R2).
+
+    Thread-safe (double-checked lock: waitress serves concurrent requests) and
+    attribute-transparent: ``proxy.test_client()``, ``proxy.config`` and friends
+    are forwarded to the real :class:`flask.Flask` app once it exists.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._args = args
+        self._kwargs = kwargs
+        self._app: Flask | None = None
+        self._lock = threading.Lock()
+
+    def resolve(self) -> Flask:
+        """Return the Flask app, creating it on the first call."""
+        app = self._app
+        if app is None:
+            with self._lock:
+                if self._app is None:
+                    self._app = create_app(*self._args, **self._kwargs)
+                    log.info("Lazy WSGI app materialised on first use (R2)")
+                app = self._app
+        return app
+
+    def __call__(self, environ: Any, start_response: Any) -> Any:
+        """WSGI entry point (called by waitress with the usual 2 arguments)."""
+        return self.resolve()(environ, start_response)
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy unknown attributes to the real Flask app (tooling sugar)."""
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.resolve(), name)
+
+
+#: WSGI app for Waitress/Docker CMD (``daylio_api.app:app``).
+app = _LazyWsgiApp()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    # Development server: the development app is built eagerly on purpose.
+    create_app().run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))

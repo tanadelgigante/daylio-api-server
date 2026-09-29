@@ -21,17 +21,22 @@ Point contract (§5.4):
   - timestamp   : fixed at the START of the day (``YYYY-MM-DDT00:00:00Z``) so the
                   daily point is always overwritten by a later upsert.
 
-Injectable client : ``InfluxStore(config, client=...)`` accepts any object
-  implementing the minimal duck-typed contract used by this module:
-     ``ping() -> bool``
-     ``write(bucket: str, record: dict) -> None``
-     ``delete(start: str, stop: str, predicate: str, bucket: str, org: str) -> None``
-     ``query(flux: str) -> list``
-     ``close() -> None``
+  Injectable client : ``InfluxStore(config, client=...)`` accepts any object
+   implementing the minimal duck-typed contract used by this module:
+      ``ping() -> bool``
+      ``write(bucket: str, record: dict) -> None``
+      ``delete(start: str, stop: str, predicate: str, bucket: str, org: str) -> None``
+      ``query(flux: str) -> list``
+      ``close() -> None``
   The real client is wrapped in :class:`_InfluxClientAdapter`; tests inject a
   fake (``tests/fakes.py``) so no server is required. Importing this module
   never connects (R8 tolerance: a missing/unreachable server is logged and the
   caller decides, it is never fatal for the SQLite source of truth).
+
+Analytics (Fase 6, R4): :func:`pivot_daily_points` + :meth:`InfluxStore.
+  read_daily_points` turn the raw Flux rows into ONE dict per (user, date) —
+  the single read abstraction the dashboard endpoints are built on, so the
+  aggregations never touch SQLite (D4/R4) and stay testable with the fake.
 ================================================================================
 """
 
@@ -125,12 +130,16 @@ def build_scale_key_map(cfg: Any = None) -> dict[str, str]:
     return key_map
 
 
-def _scale_key_for_display(display: Any, scale_keys: dict[str, str] | None) -> str | None:
+def scale_key_for_display(display: Any, scale_keys: dict[str, str] | None = None) -> str | None:
     """Resolve a scale display label to its config key (best-effort).
 
     Falls back to a sanitized display name when the mapping has no entry, so a
     resync of SQLite rows never loses a scale from the analytics even when the
     config changed (documented tolerance, §5.4).
+
+    PUBLIC on purpose: the dashboard's ``scales-trend`` ``?scale=`` validation
+    must map a custom scale label to the SAME key the writer used, so the read
+    and the write side can never disagree on a scale name.
     """
     key_map = scale_keys if scale_keys is not None else _default_scale_key_map()
     key = key_map.get(str(display).strip().casefold())
@@ -138,6 +147,10 @@ def _scale_key_for_display(display: Any, scale_keys: dict[str, str] | None) -> s
         return str(key)
     sanitized = re.sub(r"[^a-z0-9_]+", "_", str(display).strip().lower()).strip("_")
     return sanitized or None
+
+
+#: Backwards-compatible alias (the helper used to be private).
+_scale_key_for_display = scale_key_for_display
 
 
 def _normalize_record_for_influx(record: Any) -> dict[str, Any]:
@@ -277,16 +290,110 @@ def _normalize_query_rows(rows: Any) -> list[dict[str, Any]]:
 
     The real ``influxdb-client`` returns ``FluxTable``/``FluxRecord`` objects
     (one record per field); the injected fake returns plain point dicts. Both
-    are flattened here; the pivot/serialization for the analytics endpoints is
-    Phase 4/6 work.
+    are flattened here; :func:`pivot_daily_points` then regroups the field rows
+    into one point per (user, date) for the analytics endpoints (Fase 6).
     """
     normalized: list[dict[str, Any]] = []
     for row in rows or []:
         if isinstance(row, dict):
             normalized.append(dict(row))
-        elif hasattr(row, "values") and isinstance(row.values, dict):
+        elif isinstance(getattr(row, "values", None), dict):
             normalized.append(dict(row.values))
+        elif getattr(row, "records", None):
+            # FluxTable: iterate the records it holds.
+            for record in row.records:
+                values = getattr(record, "values", None)
+                if isinstance(values, dict):
+                    normalized.append(dict(values))
     return normalized
+
+
+# --------------------------------------------------------------------------- #
+# Analytics pivot (Fase 6, R4/D4) — one record per (user, date)
+# --------------------------------------------------------------------------- #
+#: Flux bookkeeping keys: they are not tags and never carry record data.
+_FLUX_META_KEYS = frozenset(
+    {"_measurement", "_field", "_value", "_time", "_start", "_stop", "result", "table"}
+)
+
+
+def _new_pivot_entry(user: str, date: str, time_value: Any) -> dict[str, Any]:
+    """Create the empty pivot accumulator for one (user, date) pair."""
+    return {
+        "user": user,
+        "date": date,
+        "time": time_value,
+        "tags": {},
+        "fields": {},
+    }
+
+
+def pivot_daily_points(rows: Any) -> list[dict[str, Any]]:
+    """Regroup raw Flux rows into one analytics record per ``(user, date)``.
+
+    Two input shapes are supported, both normalized by
+    :func:`_normalize_query_rows`:
+
+    - **real client**: one FluxRecord per FIELD, i.e. dicts shaped like
+      ``{"_time": ..., "_field": "mood", "_value": 2, "user": "alice",
+      "date": "2026-01-05", ...}``. They are re-grouped by ``(user, date)``:
+      non-underscore keys become tags, ``_field``/``_value`` become fields.
+    - **injected fake** (and any client returning whole points): dicts shaped
+      like the §5.4 point ``{"measurement", "tags", "fields", "time"}``.
+
+    Returns:
+        A list of ``{"user", "date", "time", "tags", "fields"}`` records sorted
+        by ``(date, user)``, one per day (R5/D3: a single point per day).
+    """
+    points: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        tags_in = row.get("tags")
+        fields_in = row.get("fields")
+        if isinstance(tags_in, dict) and isinstance(fields_in, dict):
+            # Whole point (fake client): merge its tags/fields as they are.
+            user = str(tags_in.get("user") or "")
+            date = str(tags_in.get("date") or str(row.get("time") or "")[:10])
+            entry = points.setdefault(
+                (user, date), _new_pivot_entry(user, date, row.get("time"))
+            )
+            entry["tags"].update(tags_in)
+            entry["fields"].update(fields_in)
+            if row.get("time"):
+                entry["time"] = row["time"]
+            continue
+        # FluxRecord shape: one field per row, tags as plain keys.
+        time_value = str(row.get("_time") or "")
+        user = str(row.get("user") or "")
+        date = str(row.get("date") or time_value[:10])
+        if not date:
+            continue
+        entry = points.setdefault((user, date), _new_pivot_entry(user, date, time_value))
+        for key, value in row.items():
+            if key in _FLUX_META_KEYS or key.startswith("_"):
+                continue
+            entry["tags"][key] = value
+        field_name = str(row.get("_field") or "")
+        if field_name:
+            entry["fields"][field_name] = row.get("_value")
+    return sorted(points.values(), key=lambda point: (point["date"], point["user"]))
+
+
+def date_in_range(value: str, start: str | None = None, end: str | None = None) -> bool:
+    """Inclusive ``YYYY-MM-DD`` range test on ISO strings (lexicographic order).
+
+    The Influx query already bounds the query window, but the range is applied
+    here as well so an injected client that ignores the Flux text (the test
+    fake) honours the very same filters.
+    """
+    if not value:
+        return False
+    if start and value < start:
+        return False
+    if end and value > end:
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -454,6 +561,32 @@ class InfluxStore:
         )
         rows = self.client().query(flux)
         return _normalize_query_rows(rows)
+
+    def read_daily_points(
+        self, user: str, start: str | None = None, end: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Read the user's daily points, pivoted to one record per day (Fase 6).
+
+        This is THE read abstraction used by the dashboard analytics endpoints
+        (D4/R4: they never fall back to SQLite). It is ``read_entries`` +
+        :func:`pivot_daily_points` + the inclusive date filter, so the real
+        Flux query and an injected fake honour the same bounds.
+
+        Args:
+            user: username (the point ``user`` tag).
+            start: optional inclusive lower bound ``YYYY-MM-DD``.
+            end: optional inclusive upper bound ``YYYY-MM-DD``.
+
+        Returns:
+            ``[{"user", "date", "time", "tags", "fields"}, ...]`` sorted by date
+            ascending; empty when the user has no points in the window.
+        """
+        points = pivot_daily_points(self.read_entries(user, start, end))
+        return [
+            point
+            for point in points
+            if point["user"] == user and date_in_range(point["date"], start, end)
+        ]
 
     def set_scale_keys(self, scale_keys: dict[str, str] | None) -> None:
         """Register the display->key map used when building points (resync)."""

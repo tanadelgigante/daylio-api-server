@@ -307,8 +307,12 @@ def _effective_user() -> str:
 
     Rules (multi-user isolation, Fase 5):
       - anonymous viewer -> 401 (data routes are ``@login_required`` anyway);
+      - an ABSENT **or empty/whitespace-only** ``?user=`` -> the viewer's own
+        username. An empty value is a missing filter, not a request for the
+        empty username: it used to resolve the scope to ``""`` and answered
+        every chart with an empty dataset (and a 403 for a non-admin);
       - non-admin with ``?user=<other>`` -> 403;
-      - otherwise return the explicit ``?user=`` or the viewer's own username.
+      - otherwise return the explicit ``?user=`` (admin may scope to anyone).
 
     Precondition: the view is ``@login_required``, so ``current_user()`` is not
     None; the guard is kept for defence in depth.
@@ -317,8 +321,8 @@ def _effective_user() -> str:
     if viewer is None:
         abort(401, description="authentication required")
     viewer_name = str(viewer["username"])
-    requested = request.args.get("user")
-    if requested is None:
+    requested = (request.args.get("user") or "").strip()
+    if not requested:
         return viewer_name
     if requested == viewer_name or bool(viewer.get("is_admin")):
         return requested

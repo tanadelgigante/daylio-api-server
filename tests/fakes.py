@@ -13,16 +13,21 @@ Scope    : Fase 3 — the InfluxDB client is injectable (``InfluxStore(client=..
              ``query(flux) -> list[dict]``
              ``close() -> None``
 
-           plus test helpers:
-             - ``get(user, date)``   the latest point for (user, date)
-             - ``count(user=None)``  number of stored points
-             - ``points``            raw point list (deep copies of writes)
-             - ``deleted``           trail of every delete-day call
+            plus test helpers:
+              - ``get(user, date)``   the latest point for (user, date)
+              - ``count(user=None)``  number of stored points
+              - ``points``            raw point list (deep copies of writes)
+              - ``deleted``           trail of every delete-day call
+              - ``queries``           trail of every Flux query (Fase 6: proves
+                                       an endpoint really read from Influx)
+              - ``available``         flip to False to simulate an unreachable
+                                       InfluxDB (``ping() -> False`` -> the
+                                       dashboard analytics answer 503, R4/R8)
 
 Behaviour mirrors the real delete-and-write strategy (§5.4): a write for a
 ``(user, date)`` always goes through ``delete`` first, so the resulting point
 set never contains leftover fields of a previous write (R8).
-===============================================================================
+================================================================================
 """
 
 from __future__ import annotations
@@ -43,18 +48,27 @@ class FakeInfluxClient:
     ``daylio_api.db.influx_store.build_daily_point``. ``delete`` removes every
     point whose measurement, user tag and timestamp window match — the same
     semantic the real delete API implements on the TSDB.
+
+    ``query`` intentionally IGNORES the Flux text and returns every point: the
+    real range/user filtering is applied by
+    ``InfluxStore.read_daily_points`` on top of the pivot, so the fake exercises
+    exactly the same Python code path as a live server.
     """
 
     def __init__(self) -> None:
         self.points: list[dict[str, Any]] = []
         self.deleted: list[dict[str, str]] = []
+        self.queries: list[str] = []
+        #: Flip to False to simulate an unreachable InfluxDB (Fase 6 503 path).
+        self.available = True
 
     # ------------------------------------------------------------------ #
     # Duck-typed client contract
     # ------------------------------------------------------------------ #
     def ping(self, **kwargs: Any) -> bool:
-        """Simulate a live InfluxDB."""
-        return True
+        """Report the simulated availability (``available`` flag)."""
+        return bool(self.available)
+
 
     def write(self, bucket: str, record: dict[str, Any]) -> None:
         """Store a deep copy of the written point (bucket ignored: single fake)."""
@@ -83,7 +97,13 @@ class FakeInfluxClient:
         ]
 
     def query(self, flux: str) -> list[dict[str, Any]]:
-        """Return deep copies of all stored points (read contract, not pivoted)."""
+        """Return deep copies of all stored points (read contract, not pivoted).
+
+        The Flux text is recorded in ``queries`` (Fase 6 asserts the dashboard
+        really goes through InfluxDB) but not interpreted: range/user filtering
+        happens in ``InfluxStore.read_daily_points``.
+        """
+        self.queries.append(flux)
         return copy.deepcopy(self.points)
 
     def close(self) -> None:
