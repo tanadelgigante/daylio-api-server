@@ -563,8 +563,9 @@ Pseudo-flusso operativo (da implementare come step nel job build):
 | --- | --- | --- | --- |
 | Utente / Orchestratore | | 2026-09-22 | **Approvato 2026-09-22** — tutti i punti del §11 risolti (D13–D18 confermati) |
 | Designer | | 2026-09-22 | Bozza completa aggiornata (conferme + config YAML) |
-| Coder | | | |
-| Tester | | | |
-| Writer | | | |
+| Coder | | 2026-10-10 | **Fasi 0–7 completate** — implementazione integrale del piano, verifiche verdi (413 passati) |
+| Tester | | 2026-10-10 | **Verifiche indipendenti Fasi 0–7 completate** — criteri di accettazione tutti soddisfatti |
+| Writer | | 2026-10-10 | **Documentazione Fase 7 completata** — README inglese + docs/ tecnici + wiki fallback |
 
 *Documento approvato 2026-09-22; il piano viene eseguito dalle fasi 0→7 nell'ordine; qualsiasi scostamento richiede una revisione di questo documento (D12).*
+*Stato finale (2026-10-10): piano eseguito integralmente (fasi 0→7), 413 test verdi, workflow CI pronto per il runner Gitea; `version.ini` = `2.0.0-SNAPSHOT`.*

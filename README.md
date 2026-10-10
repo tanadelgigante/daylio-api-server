@@ -193,8 +193,7 @@ daylio-api-server/
 ├── Dockerfile               # multi-stage build, Waitress runtime
 ├── docker-compose.yml       # app + influxdb
 ├── pyproject.toml           # metadata, dependencies, ruff/pytest config
-├── version.ini              # single source of the version
-└── server.py                # legacy v1 single-file server (kept for reference; not used by v2)
+└── version.ini              # single source of the version
 ```
 
 ## Development
