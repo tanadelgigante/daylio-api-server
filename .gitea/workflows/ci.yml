@@ -1,0 +1,701 @@
+# =============================================================================
+# Daylio API Server — CI pipeline (WORKPLAN FASE 7, R9, D9/D14/D15/D16/D18)
+# -----------------------------------------------------------------------------
+# Combined schema, §8.2 of docs/WORKPLAN.md:
+#   0 ci-skip-check : [skip-ci] gate (flatpress pattern)
+#   1 lint          : ruff, python:3.12-slim
+#   2 test          : pytest (+ optional live InfluxDB integration, D18)
+#   3 build         : multi-arch Docker build&push, push events only (infra-tools)
+#   4 release       : MANUAL via workflow_dispatch only (never on push/tag)
+#   5 notify        : single Ntfy notification of the whole run
+#
+# Patterns borrowed from:
+#   flatpress-publish-article-plugin/.gitea/workflows/ci.yml
+#       (skip-ci gate, DNS/CA bootstrap per job, release + version bump, notify)
+#   infrastructure-tools/.gitea/workflows/ci.yml
+#       (alpine container, apk_install_with_retry, QEMU binfmt, buildx multiarch,
+#        diff-guard on the Dockerfile, docker login via --password-stdin, notify)
+#
+# Required repository configuration (Settings -> Actions):
+#   vars:    DNS, NTFY_URL, NTFY_TOPIC, INFLUX_INSTANCE ("<ip>:<port>"),
+#            IMAGE_REPO (default tanadelgigante/daylio-api-server),
+#            APP_VERSION, DOCKER_REGISTRY (default docker.io)
+#   secrets: DUNGEONCACERT, DOCKER_USERNAME, DOCKER_PASSWORD, INFLUX_TOKEN,
+#            GITEA_TOKEN
+#
+# Commit-message tokens (R9 / D9):
+#   [skip-ci]  skips lint, test, build and release (flatpress convention)
+#   [skip]     skips only the Docker build (infrastructure-tools convention);
+#              matched as a STANDALONE token, so it never fires on [skip-ci]
+# =============================================================================
+
+name: CI
+
+env:
+  # Internal DNS resolvers used by every job container (flatpress pattern).
+  INTERNAL_DNS: "${{ vars.DNS }}"
+  # Ntfy endpoint for the final, single notification (D16).
+  NTFY_URL: "${{ vars.NTFY_URL }}"
+  NTFY_TOPIC: "${{ vars.NTFY_TOPIC }}"
+  # Docker registry used by the build job (D15a).
+  DOCKER_REGISTRY: "${{ vars.DOCKER_REGISTRY }}"
+  # Image name (D15a) — falls back to the confirmed default inside the step.
+  IMAGE_REPO: "${{ vars.IMAGE_REPO }}"
+  # Fallback tag source when version.ini cannot be parsed (D15b).
+  APP_VERSION: "${{ vars.APP_VERSION }}"
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'release: publish v<version.ini without -SNAPSHOT> and bump version.ini'
+        required: true
+        default: 'release'
+      release_notes:
+        description: 'Extra release notes (optional)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Job 0: [skip-ci] gate ────────────────────────────────────────────────
+  # Computes the two skip decisions consumed by the other jobs:
+  #   should_skip : '[skip-ci]' (flatpress) — disables lint/test/build/release
+  #   skip_build  : '[skip]'   (infrastructure-tools) — disables only the build
+  # A manual workflow_dispatch is NEVER skippable.
+  ci-skip-check:
+    runs-on: local
+    outputs:
+      should_skip: ${{ steps.check.outputs.should_skip }}
+      skip_build: ${{ steps.check.outputs.skip_build }}
+    container:
+      image: alpine:3.23
+    steps:
+      - name: Configure internal DNS
+        run: |
+          set -euo pipefail
+          if [ -z "${INTERNAL_DNS:-}" ]; then
+            echo "::warning::vars.DNS is not set; keeping the container default resolver"
+            exit 0
+          fi
+          resolvconf=/etc/resolv.conf
+          if [ ! -w "$resolvconf" ] && [ ! -w /etc ]; then
+            echo "::warning::/etc/resolv.conf is not writable; skipping DNS config"
+            exit 0
+          fi
+          : > "$resolvconf"
+          for ns in $INTERNAL_DNS; do
+            printf 'nameserver %s\n' "$ns" >> "$resolvconf"
+          done
+          echo "Configured /etc/resolv.conf with resolvers: $INTERNAL_DNS"
+
+      - name: Install tooling (git, ca-certificates)
+        run: |
+          sed -i 's#^https://#http://#' /etc/apk/repositories
+          apk add --no-cache ca-certificates git
+          sed -i 's#^http://#https://#' /etc/apk/repositories
+
+      - name: Trust the Gitea CA
+        env:
+          DUNGEONCACERT: ${{ secrets.DUNGEONCACERT }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DUNGEONCACERT" ]; then
+            printf '%s\n' "$DUNGEONCACERT" > /usr/local/share/ca-certificates/gitea-ca.crt
+            update-ca-certificates
+            git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+          else
+            echo "::warning::Secret DUNGEONCACERT not set; using the system CA bundle"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether CI should be skipped
+        id: check
+        env:
+          GITEA_EVENT: ${{ github.event_name }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message || '' }}
+          PR_TITLE: ${{ github.event.pull_request.title || '' }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+          BEFORE_SHA: ${{ github.event.before || '' }}
+        run: |
+          set -euo pipefail
+
+          SHOULD_SKIP=false
+          SKIP_BUILD=false
+
+          # Collect every message that may carry a token, then test them once.
+          collect_messages() {
+            printf '%s\n' "${PR_TITLE:-}" "${HEAD_MESSAGE:-}"
+            if [ -n "${PR_HEAD_SHA:-}" ]; then
+              git log -1 --format=%B "$PR_HEAD_SHA" 2>/dev/null || true
+            fi
+            if [ "$GITEA_EVENT" = "push" ]; then
+              # Scan every pushed commit; for tag pushes/branch creation
+              # `before` is empty or all-zeros, so fall back to the last 20
+              # commits (bounded, so a fresh repository or a tag push never
+              # inherits an ancient [skip-ci] — HEAD is the tagged commit).
+              if [ -n "${BEFORE_SHA:-}" ] && ! printf '%s' "$BEFORE_SHA" | grep -Eq '^0+$'; then
+                git log --format=%B "${BEFORE_SHA}..HEAD" 2>/dev/null \
+                  || git log -n 20 --format=%B HEAD 2>/dev/null || true
+              else
+                git log -n 20 --format=%B HEAD 2>/dev/null || true
+              fi
+            fi
+          }
+
+          if [ "$GITEA_EVENT" = "workflow_dispatch" ]; then
+            # Manual dispatch is explicitly requested, never skippable.
+            SHOULD_SKIP=false
+            SKIP_BUILD=false
+          else
+            MESSAGES="$(collect_messages)"
+            if printf '%s\n' "$MESSAGES" | grep -Fq '[skip-ci]'; then
+              SHOULD_SKIP=true
+            fi
+            # [skip] as a STANDALONE token only, so [skip-ci] does not also
+            # set it: `grep -E '\[skip\]([^[:alnum:]-]|$)'`.
+            if printf '%s\n' "$MESSAGES" | grep -Eq '\[skip\]([^[:alnum:]-]|$)'; then
+              SKIP_BUILD=true
+            fi
+          fi
+
+          echo "Event=$GITEA_EVENT should_skip=$SHOULD_SKIP skip_build=$SKIP_BUILD"
+          echo "should_skip=$SHOULD_SKIP" >> "$GITHUB_OUTPUT"
+          echo "skip_build=$SKIP_BUILD" >> "$GITHUB_OUTPUT"
+
+  # ── Job 1: lint (ruff) ──────────────────────────────────────────────────
+  # Container python:3.12-slim: lean image, pip/ruff only (§8.2 note).
+  lint:
+    if: needs.ci-skip-check.outputs.should_skip != 'true'
+    needs: [ci-skip-check]
+    runs-on: local
+    container:
+      image: python:3.12-slim
+      env:
+        PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        PIP_NO_CACHE_DIR: "1"
+        PIP_DEFAULT_TIMEOUT: "100"
+    steps:
+      - name: Configure internal DNS
+        run: |
+          set -euo pipefail
+          if [ -z "${INTERNAL_DNS:-}" ]; then
+            echo "::warning::vars.DNS is not set; keeping the container default resolver"
+            exit 0
+          fi
+          resolvconf=/etc/resolv.conf
+          if [ ! -w "$resolvconf" ] && [ ! -w /etc ]; then
+            echo "::warning::/etc/resolv.conf is not writable; skipping DNS config"
+            exit 0
+          fi
+          : > "$resolvconf"
+          for ns in $INTERNAL_DNS; do
+            printf 'nameserver %s\n' "$ns" >> "$resolvconf"
+          done
+          echo "Configured /etc/resolv.conf with resolvers: $INTERNAL_DNS"
+
+      - name: Install tooling (git, ca-certificates)
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Trust the Gitea CA
+        env:
+          DUNGEONCACERT: ${{ secrets.DUNGEONCACERT }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DUNGEONCACERT" ]; then
+            printf '%s\n' "$DUNGEONCACERT" > /usr/local/share/ca-certificates/gitea-ca.crt
+            update-ca-certificates
+            git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+          else
+            echo "::warning::Secret DUNGEONCACERT not set; using the system CA bundle"
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Install ruff
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir "ruff>=0.4"
+          ruff --version
+
+      - name: Run ruff
+        run: |
+          set -euo pipefail
+          # Excludes the generated venv and caches via pyproject.toml; the whole
+          # importable surface is checked (src, tests, scripts).
+          ruff check src tests scripts
+
+  # ── Job 2: tests (pytest, with optional live InfluxDB) ───────────────────
+  test:
+    if: needs.ci-skip-check.outputs.should_skip != 'true'
+    needs: [ci-skip-check]
+    runs-on: local
+    container:
+      image: python:3.12-slim
+      env:
+        PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        PIP_NO_CACHE_DIR: "1"
+        PIP_DEFAULT_TIMEOUT: "100"
+    steps:
+      - name: Configure internal DNS
+        run: |
+          set -euo pipefail
+          if [ -z "${INTERNAL_DNS:-}" ]; then
+            echo "::warning::vars.DNS is not set; keeping the container default resolver"
+            exit 0
+          fi
+          resolvconf=/etc/resolv.conf
+          if [ ! -w "$resolvconf" ] && [ ! -w /etc ]; then
+            echo "::warning::/etc/resolv.conf is not writable; skipping DNS config"
+            exit 0
+          fi
+          : > "$resolvconf"
+          for ns in $INTERNAL_DNS; do
+            printf 'nameserver %s\n' "$ns" >> "$resolvconf"
+          done
+          echo "Configured /etc/resolv.conf with resolvers: $INTERNAL_DNS"
+
+      - name: Install tooling (git, ca-certificates)
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Trust the Gitea CA
+        env:
+          DUNGEONCACERT: ${{ secrets.DUNGEONCACERT }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DUNGEONCACERT" ]; then
+            printf '%s\n' "$DUNGEONCACERT" > /usr/local/share/ca-certificates/gitea-ca.crt
+            update-ca-certificates
+            git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+          else
+            echo "::warning::Secret DUNGEONCACERT not set; using the system CA bundle"
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Install project and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir --upgrade pip
+          # Locked runtime dependencies first (same source as the Docker build),
+          # then the package itself and the dev tools; this keeps CI in parity
+          # with the image instead of re-resolving ranges on every run.
+          python -m pip install --no-cache-dir -r requirements.lock
+          python -m pip install --no-cache-dir --no-deps -e .
+          python -m pip install --no-cache-dir "pytest>=8.0" "ruff>=0.4"
+          python -m pip list 2>/dev/null | grep -Ei 'flask|pytest|ruff|influxdb|waitress|apscheduler' || true
+
+      - name: Configure InfluxDB integration (D18)
+        env:
+          INFLUX_INSTANCE: ${{ vars.INFLUX_INSTANCE }}
+        run: |
+          set -euo pipefail
+          # D18: the Gitea repo var INFLUX_INSTANCE holds "<ip>:<port>"
+          # (e.g. 192.168.188.120:8120) and the URL is built from it here.
+          # When it is absent the live-integration tests marked "influx" are
+          # deselected; every other test (FakeInfluxClient-based) always runs.
+          if [ -n "${INFLUX_INSTANCE:-}" ]; then
+            echo "INFLUX_URL=http://${INFLUX_INSTANCE}" >> "$GITHUB_ENV"
+            echo "INFLUX_INSTANCE=${INFLUX_INSTANCE}" >> "$GITHUB_ENV"
+            echo "INFLUX_ORG=tanadelgigante" >> "$GITHUB_ENV"
+            echo "INFLUX_BUCKET=daylio" >> "$GITHUB_ENV"
+            echo "RUN_INFLUX_TESTS=1" >> "$GITHUB_ENV"
+            echo "Live InfluxDB integration ENABLED (instance ${INFLUX_INSTANCE})."
+          else
+            echo "::warning::vars.INFLUX_INSTANCE not set; live InfluxDB tests will be skipped"
+            echo "CI_SKIP_INFLUX=1" >> "$GITHUB_ENV"
+            echo "RUN_INFLUX_TESTS=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run pytest
+        env:
+          # Only the tests marked `influx` read these; they are skipped unless
+          # RUN_INFLUX_TESTS=1 (see the step above).
+          INFLUX_TOKEN: ${{ secrets.INFLUX_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${RUN_INFLUX_TESTS:-0}" = "1" ]; then
+            echo "Running the FULL suite (unit + fake + live InfluxDB integration)."
+            python -m pytest -q
+          else
+            echo "Running the suite without the live InfluxDB tests (-m 'not influx')."
+            python -m pytest -q -m "not influx"
+          fi
+
+  # ── Job 3: build & push the multi-arch image (push events only) ─────────
+  # Pattern infrastructure-tools §8.3: alpine + docker-cli/buildx + QEMU +
+  # custom CA, buildx multiarch, diff-guard on the Dockerfile, tag from
+  # version.ini with vars.APP_VERSION / matrix.tag fallbacks (D15b).
+  build:
+    if: github.event_name == 'push' && needs.ci-skip-check.outputs.should_skip != 'true' && needs.ci-skip-check.outputs.skip_build != 'true'
+    needs: [ci-skip-check]
+    runs-on: local
+    container:
+      image: alpine:3.23
+      options: >-
+        --dns 192.168.188.120
+        --dns 192.168.188.110
+        --dns 192.168.188.105
+    env:
+      ALPINE_VERSION: "3.23"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # image_repo is the D15a default; vars.IMAGE_REPO overrides it.
+          - image_repo: "tanadelgigante/daylio-api-server"
+            dockerfile: "Dockerfile"
+            context: "."
+            build_args: ""
+            tag: "build-${{ github.run_number }}"
+    steps:
+      - name: Configure internal DNS
+        run: |
+          set -euo pipefail
+          if [ -z "${INTERNAL_DNS:-}" ]; then
+            echo "::warning::vars.DNS is not set; keeping the container default resolver"
+            exit 0
+          fi
+          resolvconf=/etc/resolv.conf
+          if [ ! -w "$resolvconf" ] && [ ! -w /etc ]; then
+            echo "::warning::/etc/resolv.conf is not writable; skipping DNS config"
+            exit 0
+          fi
+          : > "$resolvconf"
+          for ns in $INTERNAL_DNS; do
+            printf 'nameserver %s\n' "$ns" >> "$resolvconf"
+          done
+          echo "Configured /etc/resolv.conf with resolvers: $INTERNAL_DNS"
+
+      - name: Install dependencies & setup custom CA
+        env:
+          DUNGEON_CA: ${{ secrets.DUNGEONCACERT }}
+        run: |
+          apk_install_with_retry() {
+            local max_attempts=5
+            local attempt=1
+            until apk add --no-cache "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "ERROR: apk add failed after $max_attempts attempts" >&2
+                return 1
+              fi
+              echo "apk add failed (attempt $attempt/$max_attempts), retrying in 5s..."
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+          }
+
+          apk_install_with_retry git curl openssl-client docker-cli docker-cli-buildx qemu ca-certificates
+
+          # Register QEMU binfmt handlers for cross-platform builds (arm64)
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
+
+          if [ -n "$DUNGEON_CA" ]; then
+            echo "Adding the internal CA certificate..."
+            echo "$DUNGEON_CA" > /usr/local/share/ca-certificates/dungeon-ca.crt
+            update-ca-certificates
+          else
+            echo "WARNING: Secret DUNGEONCACERT not found!"
+          fi
+
+      - name: Setup Docker buildx
+        run: |
+          docker buildx create --name multiarch --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build and push ${{ matrix.image_repo }}
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -e
+          DOCKERFILE="${{ matrix.dockerfile }}"
+          CONTEXT="${{ matrix.context }}"
+
+          echo "Checking whether ${DOCKERFILE} has been modified..."
+
+          if ! git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "^${DOCKERFILE}"; then
+            echo "${DOCKERFILE} NOT modified, skipping build (job stays green)."
+            exit 0
+          fi
+
+          echo "${DOCKERFILE} modified, proceeding with the multi-arch build."
+
+          # Tag resolution (D15b): version.ini -> vars.APP_VERSION -> matrix.tag.
+          IMAGE_REPO_EFFECTIVE="${IMAGE_REPO:-${{ matrix.image_repo }}}"
+          REGISTRY="${DOCKER_REGISTRY:-docker.io}"
+          RAW_VERSION="$(tr -d '[:space:]' < version.ini 2>/dev/null || true)"
+          VERSION="${RAW_VERSION#v}"
+          VERSION="${VERSION%-SNAPSHOT}"
+          if [ -n "$VERSION" ]; then
+            TAG="v${VERSION}"
+          elif [ -n "${APP_VERSION:-}" ]; then
+            TAG="v${APP_VERSION#v}"
+          else
+            TAG="${{ matrix.tag }}"
+          fi
+
+          echo "Using build context: ${CONTEXT}"
+          echo "Building and pushing ${IMAGE_REPO_EFFECTIVE}:${TAG} (linux/amd64,linux/arm64) to ${REGISTRY}..."
+
+          if [ -z "${DOCKER_USERNAME:-}" ] || [ -z "${DOCKER_PASSWORD:-}" ]; then
+            echo "ERROR: Docker credentials not set"
+            exit 1
+          fi
+
+          echo "$DOCKER_PASSWORD" | docker login --username "$DOCKER_USERNAME" --password-stdin "$REGISTRY"
+
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            ${{ matrix.build_args }} \
+            -t "${IMAGE_REPO_EFFECTIVE}:${TAG}" \
+            -f "$DOCKERFILE" \
+            "$CONTEXT" \
+            --push
+
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "✅ ${IMAGE_REPO_EFFECTIVE}:${TAG} pushed successfully (multi-arch)"
+
+  # ── Job 4: release (MANUAL only — never on push, never on tag) ──────────
+  # Flatpress pattern: workflow_dispatch with job=release creates the Gitea
+  # release from version.ini, then bumps version.ini and pushes that commit.
+  release:
+    if: >-
+      needs.ci-skip-check.outputs.should_skip != 'true' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.job == 'release'
+    needs: [lint, test, ci-skip-check]
+    runs-on: local
+    permissions:
+      contents: write
+    outputs:
+      release_version: ${{ steps.resolve_version.outputs.version }}
+      bumped_version: ${{ steps.bump.outputs.bump_version }}
+    container:
+      image: alpine:3.23
+      env:
+        # Token used to publish the release through the Gitea API.
+        GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+    steps:
+      - name: Configure internal DNS
+        run: |
+          set -euo pipefail
+          if [ -z "${INTERNAL_DNS:-}" ]; then
+            echo "::warning::vars.DNS is not set; keeping the container default resolver"
+            exit 0
+          fi
+          resolvconf=/etc/resolv.conf
+          if [ ! -w "$resolvconf" ] && [ ! -w /etc ]; then
+            echo "::warning::/etc/resolv.conf is not writable; skipping DNS config"
+            exit 0
+          fi
+          : > "$resolvconf"
+          for ns in $INTERNAL_DNS; do
+            printf 'nameserver %s\n' "$ns" >> "$resolvconf"
+          done
+          echo "Configured /etc/resolv.conf with resolvers: $INTERNAL_DNS"
+
+      - name: Install tooling (git, curl, jq, python3)
+        run: |
+          sed -i 's#^https://#http://#' /etc/apk/repositories
+          apk add --no-cache ca-certificates git curl jq python3
+          sed -i 's#^http://#https://#' /etc/apk/repositories
+
+      - name: Trust the Gitea CA
+        env:
+          DUNGEONCACERT: ${{ secrets.DUNGEONCACERT }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DUNGEONCACERT" ]; then
+            printf '%s\n' "$DUNGEONCACERT" > /usr/local/share/ca-certificates/gitea-ca.crt
+            update-ca-certificates
+            git config --global http.sslCAInfo /etc/ssl/certs/ca-certificates.crt
+          else
+            echo "::warning::Secret DUNGEONCACERT not set; using the system CA bundle"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: resolve_version
+        run: |
+          set -euo pipefail
+          # Only the manual dispatch reaches this job, so the tag always comes
+          # from version.ini (flatpress pattern: strip the -SNAPSHOT suffix).
+          RAW="$(tr -d '[:space:]' < version.ini)"
+          VERSION="v${RAW#v}"
+          VERSION="${VERSION%-SNAPSHOT}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION (from version.ini)"
+
+      - name: Create Gitea release
+        env:
+          EXTRA_NOTES: ${{ github.event.inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          TAG="${{ steps.resolve_version.outputs.version }}"
+          API="${GITHUB_SERVER_URL}/api/v1/repos/${OWNER}/${REPO}"
+          AUTH="Authorization: token ${GITEA_TOKEN}"
+
+          if [ -z "${GITEA_TOKEN:-}" ]; then
+            echo "::error::Secret GITEA_TOKEN is required to publish the release" >&2
+            exit 1
+          fi
+
+          # Release notes from the commits since the previous tag.
+          PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+          else
+            RANGE="-20"
+          fi
+          NOTES="$(git log --pretty='* %s (%h)' $RANGE 2>/dev/null || true)"
+          if [ -n "${EXTRA_NOTES:-}" ]; then
+            NOTES="${EXTRA_NOTES}
+          ${NOTES}"
+          fi
+          BODY="$(printf '## %s\n\n%s\n' "$TAG" "$NOTES")"
+
+          # Reuse the release if it already exists (idempotent re-runs).
+          EXISTING="$(curl -sS -H "$AUTH" "${API}/releases/tags/${TAG}" || true)"
+          RELEASE_ID="$(printf '%s' "$EXISTING" | jq -r '.id // empty' 2>/dev/null || true)"
+
+          if [ -n "$RELEASE_ID" ]; then
+            jq -n --arg body "$BODY" '{body:$body}' > /tmp/release.json
+            curl -sS -X PATCH -H "$AUTH" -H 'Content-Type: application/json' \
+              --data @/tmp/release.json "${API}/releases/${RELEASE_ID}" \
+              -o /dev/null -w "Updated release ${TAG}: HTTP %{http_code}\n"
+          else
+            jq -n --arg tag "$TAG" --arg name "$TAG" --arg body "$BODY" \
+              '{tag_name:$tag,name:$name,body:$body,draft:false,prerelease:false}' > /tmp/release.json
+            curl -sS -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+              --data @/tmp/release.json "${API}/releases" \
+              -o /tmp/release.out -w "Created release ${TAG}: HTTP %{http_code}\n"
+            RELEASE_ID="$(jq -r '.id // empty' /tmp/release.out 2>/dev/null || true)"
+          fi
+
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::Could not create or find release ${TAG}" >&2
+            cat /tmp/release.out 2>/dev/null >&2 || true
+            exit 1
+          fi
+
+      - name: Bump version.ini to the next -SNAPSHOT
+        id: bump
+        run: |
+          set -euo pipefail
+
+          BRANCH="${{ github.event.repository.default_branch }}"
+          if [ -z "$BRANCH" ]; then
+            BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          fi
+          if [ "$BRANCH" = "HEAD" ]; then
+            echo "::error::Detached HEAD: cannot push the version bump" >&2
+            exit 1
+          fi
+
+          # Realign with the remote default branch BEFORE touching version.ini,
+          # so the bump commit is created on top of the current origin state.
+          git config user.name "CI bot"
+          git config user.email "ci-bot@localhost"
+          git fetch origin
+          git checkout "$BRANCH"
+          git pull --ff-only origin "$BRANCH"
+
+          CURRENT="$(tr -d '[:space:]' < version.ini)"
+          NEXT="$(python3 scripts/bump_version.py --dry-run | sed -n 's/^bump_version=//p')"
+          echo "Bumping version.ini: ${CURRENT} -> ${NEXT}"
+
+          # The script writes the file, creates the commit and pushes it; a
+          # failure at any step makes the job fail.
+          python3 scripts/bump_version.py --commit --push --branch "$BRANCH" \
+            --message "Bump version to ${NEXT} after release ${{ steps.resolve_version.outputs.version }} [skip-ci]"
+          # Re-emit explicitly: the script writes to $GITHUB_OUTPUT too, but the
+          # job output must be readable even when the file append is disabled.
+          echo "bump_version=${NEXT}" >> "$GITHUB_OUTPUT"
+
+          git fetch origin
+          git checkout "$BRANCH"
+          git pull --ff-only origin "$BRANCH"
+          git push origin "HEAD:${BRANCH}"
+
+  # ── Job 5: single Ntfy notification for the whole run ───────────────────
+  notify:
+    if: always()
+    needs: [ci-skip-check, lint, test, build, release]
+    runs-on: local
+    container:
+      image: alpine:3.23
+    steps:
+      - name: Install curl
+        run: |
+          sed -i 's#^https://#http://#' /etc/apk/repositories
+          apk add --no-cache ca-certificates curl
+          sed -i 's#^http://#https://#' /etc/apk/repositories
+
+      - name: Send Ntfy notification
+        env:
+          JOB_RESULTS: "skip-check=${{ needs.ci-skip-check.result }},lint=${{ needs.lint.result }},test=${{ needs.test.result }},build=${{ needs.build.result }},release=${{ needs.release.result }}"
+        run: |
+          set -euo pipefail
+
+          if [ -z "${NTFY_URL:-}" ] || [ -z "${NTFY_TOPIC:-}" ]; then
+            echo "::warning::NTFY_URL/NTFY_TOPIC not set; skipping notification"
+            exit 0
+          fi
+
+          STATUS="success"
+          if [[ "$JOB_RESULTS" == *failure* ]]; then
+            STATUS="failure"
+          elif [[ "$JOB_RESULTS" == *cancelled* ]]; then
+            STATUS="cancelled"
+          fi
+
+          SKIPPED_COUNT=0
+          for r in $(printf '%s' "$JOB_RESULTS" | tr ',' ' '); do
+            if [ "$r" = "skipped" ]; then
+              SKIPPED_COUNT=$((SKIPPED_COUNT+1))
+            fi
+          done
+          echo "Skipped jobs in this run: $SKIPPED_COUNT"
+
+          case "$STATUS" in
+            success)   TITLE="CI OK — daylio-api-server";      TAGS="white_check_mark"; PRIORITY=2 ;;
+            cancelled) TITLE="CI cancelled — daylio-api-server"; TAGS="no_entry_sign";    PRIORITY=3 ;;
+            *)         TITLE="CI FAILED — daylio-api-server";    TAGS="rotating_light";    PRIORITY=5 ;;
+          esac
+
+          MSG="Run ${GITHUB_RUN_ID} (${GITHUB_REF_NAME}) — ${STATUS}
+          results: ${JOB_RESULTS}
+          skipped: ${SKIPPED_COUNT}
+          ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          curl -fsS \
+            -H "Title: $TITLE" \
+            -H "Tags: $TAGS" \
+            -H "Priority: $PRIORITY" \
+            -d "$MSG" \
+            "${NTFY_URL%/}/${NTFY_TOPIC}"

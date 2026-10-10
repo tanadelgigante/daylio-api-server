@@ -53,3 +53,11 @@ select = ["E", "F", "W", "I", "UP", "B"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+# FASE 7 (Task 7.1, D18/R16): tests marked `influx` need a REAL InfluxDB 2.x.
+# The CI `test` job exports INFLUX_URL (built from vars.INFLUX_INSTANCE,
+# "<ip>:<port>") + INFLUX_TOKEN when the endpoint is configured, and runs the
+# full suite; otherwise it sets CI_SKIP_INFLUX=1 and runs `-m "not influx"`.
+# Every test using tests/fakes.FakeInfluxClient stays un-marked and always runs.
+markers = [
+    "influx: requires a reachable InfluxDB 2.x (INFLUX_URL/INFLUX_INSTANCE + INFLUX_TOKEN); skipped when not configured or CI_SKIP_INFLUX=1",
+]

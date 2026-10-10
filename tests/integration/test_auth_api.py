@@ -183,6 +183,61 @@ def test_api_key_is_per_user(api_client) -> None:
     assert admin_me.get_json()["user"]["username"] == "admin"
 
 
+def test_api_key_can_manage_own_keys_without_session(api_client) -> None:
+    """The /api/auth/api-keys routes must work with API-key auth too.
+
+    MAINTENANCE NOTES (FASE 7 bug fix): ``current_user()`` from the API-key
+    branch returns the ``api_keys`` x ``users`` join whose owner column is
+    ``user_id`` — the session branch returns the users row with ``id``. Views
+    here read ``current_user()["id"]``, so an API-key-authenticated client used
+    to get a 500 KeyError on GET/POST/DELETE. The normalizer in
+    ``auth._user_from_api_key`` aliases ``user_id`` onto ``id``, making the two
+    branches identical for consumers; these tests pin that both authentication
+    paths reach 200/201 (never 500).
+    """
+    _admin(api_client)
+    key = api_client.post("/api/auth/api-keys", json={"name": "bootstrap"}).get_json()[
+        "key"
+    ]
+    api_client.post("/api/auth/logout")
+    headers = {"Authorization": f"Bearer {key}"}
+
+    # GET: list own keys with API-key auth (was 500 before the fix).
+    resp = api_client.get("/api/auth/api-keys", headers=headers)
+    assert resp.status_code == 200
+    listed = resp.get_json()["api_keys"]
+    assert len(listed) == 1 and listed[0]["name"] == "bootstrap"
+
+    # POST: create another key with API-key auth (was 500 before the fix).
+    resp = api_client.post(
+        "/api/auth/api-keys", headers=headers, json={"name": "api-created"}
+    )
+    assert resp.status_code == 201
+    created = resp.get_json()
+    assert created["key"].startswith("daylio_")
+
+    # DELETE: revoke the newly created key by prefix (was 500 before the fix).
+    resp = api_client.delete(
+        f"/api/auth/api-keys/{created['prefix']}", headers=headers
+    )
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True}
+
+    # The revocation is visible: only the bootstrap key remains.
+    resp = api_client.get("/api/auth/api-keys", headers=headers)
+    assert resp.status_code == 200
+    names = [key_row["name"] for key_row in resp.get_json()["api_keys"]]
+    assert names == ["bootstrap"]
+
+    # A session-authenticated client reaches the same routes (regression pin,
+    # the original 500 reported with API keys never applied to sessions).
+    _admin(api_client)
+    resp = api_client.get("/api/auth/api-keys")
+    assert resp.status_code == 200
+    resp = api_client.post("/api/auth/api-keys", json={"name": "by-session"})
+    assert resp.status_code == 201
+
+
 # --------------------------------------------------------------------------- #
 # Admin user management (D6)
 # --------------------------------------------------------------------------- #

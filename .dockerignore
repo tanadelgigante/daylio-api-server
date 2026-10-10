@@ -1,27 +1,77 @@
-# Daylio API Server — Docker build context exclusions
-# Keep the image lean: no git, tests, docs, sample data or local artifacts.
+# =============================================================================
+# Daylio API Server — Docker build context exclusions (FASE 0 / Task 0.6,
+# verified in FASE 7 / Task 7.5).
+# -----------------------------------------------------------------------------
+# Goal: the build context must contain ONLY what the multi-stage Dockerfile
+# actually copies, so the image stays lean and no local artifact, secret or
+# test fixture can ever leak into it.
+#
+# What the Dockerfile needs from the context (never exclude these):
+#   requirements.lock          -> stage "build"  (pip install -r)
+#   src/                       -> stage "runtime" (the application package)
+#   version.ini                -> stage "runtime" (version metadata)
+#   config/config.example.yml  -> stage "runtime" (default config schema)
+#
+# Everything else is excluded: VCS metadata, virtualenvs, caches, byte-code,
+# the SQLite runtime data, tests, sample data, docs, CI and local secrets.
+# =============================================================================
 
+# --- VCS / CI ----------------------------------------------------------------
 .git
 .gitignore
+.gitea/
+.github/
+.gitattributes
+
+# --- virtualenvs & build artifacts -------------------------------------------
 .venv
-__pycache__
-*.pyc
-*.pyo
-.pytest_cache
-.ruff_cache
-*.egg-info
+venv
+env
 build
 dist
-data.db
+*.egg-info
+src/*.egg-info
+
+# --- python byte-code & tool caches -----------------------------------------
+__pycache__
+**/__pycache__
+*.py[cod]
+*.so
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- runtime data (SQLite source of truth) & local secrets -------------------
 data/
+data.db
+*.db
+*.sqlite
+*.sqlite3
 .env
+.env.*
+*.pem
+*.key
+config/config.yml
+config/users.yml
+
+# --- test / sample / documentation / tooling --------------------------------
 tests/
 sample-data/
 docs/
 scripts/
-# NOTE: config/ is intentionally included because Dockerfile copies
-# config/config.example.yml (the default schema). Real deployment configs
-# (config/config.yml with secrets) should be mounted, not baked in.
-Dockerfile
+*.md
+!README.md
+
+# --- docker & dev files (the Dockerfile itself is in the context by design) --
 docker-compose.yml
+docker-compose.*.yml
+requirements.in
+requirements.txt
 requirements-dev.in
+Makefile
+.idea/
+.vscode/

@@ -122,14 +122,30 @@ def _user_from_session() -> dict[str, Any] | None:
 
 
 def _user_from_api_key() -> dict[str, Any] | None:
-    """Resolve the identity from an API key (scripts/R6)."""
+    """Resolve the identity from an API key (scripts/R6).
+
+    MAINTENANCE NOTES (FASE 7 bug fix):
+        :func:`user_for_api_key` returns the join ``api_keys`` x ``users`` with
+        the columns ``key_id``/``user_id`` and deliberately no ``id``, while the
+        session lookup (:func:`user_by_username`) returns the users row WITH
+        ``id``. Views such as ``/api/auth/api-keys`` read ``current_user()["id"]``,
+        so the raw API-key dict raised ``KeyError`` -> HTTP 500 whenever those
+        routes were authenticated with an API key. We normalise the API-key
+        branch here to the same shape as the session branch by adding ``id``
+        (aliased from ``user_id``), keeping ``current_user()`` a single,
+        consumer-agnostic contract regardless of how the request authenticated.
+    """
     key = _key_from_request()
     if not key:
         return None
     if not current_app.config.get("DAYLIO_API_KEYS_ENABLED", True):
         return None
     key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return user_for_api_key(_store().connect(), key_hash)
+    user = user_for_api_key(_store().connect(), key_hash)
+    if user is not None:
+        # Alias the API-key user_id onto id so callers can use user["id"].
+        user.setdefault("id", user.get("user_id"))
+    return user
 
 
 def resolve_user() -> dict[str, Any] | None:
