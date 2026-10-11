@@ -300,6 +300,18 @@ The Gitea Actions workflow (`ci.yml`) builds and publishes a multi-arch image
    default `docker.io`). It then creates the Gitea release and bumps
    `version.ini`. A push or tag push never triggers a release.
 
+### TLS to the internal registry (BuildKit)
+
+`docker login` succeeds because the job container trusts the internal Dungeon
+CA (`DUNGEONCACERT` -> `update-ca-certificates`). The actual push, however, is
+performed **by the BuildKit builder container**, whose trust store does not
+include that CA — without a fix the build fails with `x509: certificate signed
+by unknown authority`. The build job therefore creates the builder with a
+`buildkitd.toml` that keeps HTTPS (`http = false`) and skips peer verification
+for the Gitea registry host **only** (`insecure = true`); the builder is
+recreated on every run so a stale instance cannot ignore the config. Docker Hub
+is never flagged insecure.
+
 ## Troubleshooting
 
 | Symptom | Cause | Action |

@@ -213,6 +213,34 @@ def test_build_pushes_to_the_gitea_container_registry(workflow: dict) -> None:
     assert "docker.io" not in run
 
 
+def test_build_tells_buildkit_to_relax_tls_for_the_internal_registry(
+    workflow: dict,
+) -> None:
+    """BuildKit performs the push from its OWN container, which cannot see the
+    internal Dungeon CA installed in the job container, so the push to the
+    internal registry fails with "x509: certificate signed by unknown
+    authority". The builder is created with a buildkitd.toml that keeps HTTPS
+    (``http = false``) and skips peer verification for the Gitea registry host
+    ONLY — Docker Hub is never flagged insecure."""
+    setup = [
+        step
+        for step in _steps(workflow["jobs"]["build"])
+        if step.get("name") == "Setup Docker buildx"
+    ]
+    assert setup, "missing 'Setup Docker buildx' step"
+    run = setup[0]["run"]
+    # The config file that lands inside the builder container.
+    assert "buildkitd.toml" in run
+    assert "GITHUB_SERVER_URL" in run
+    assert "http = false" in run
+    assert "insecure = true" in run
+    assert "--config /tmp/buildkitd.toml" in run
+    # The builder is recreated so a stale instance cannot ignore the config.
+    assert "docker buildx rm multiarch" in run
+    # The relaxation is scoped: docker.io must not appear in the buildkitd.toml.
+    assert "docker.io" not in run
+
+
 # --------------------------------------------------------------------------- #
 # Runner compatibility: node for actions/checkout (nektos/act issue #107)
 # --------------------------------------------------------------------------- #

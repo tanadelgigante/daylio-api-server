@@ -26,7 +26,11 @@
 # Registry flow (user decision 2026-10-11):
 #   build   -> the multi-arch image is pushed to the GITEA container registry
 #              ($GITHUB_SERVER_URL host / owner/repo), so it can be pulled and
-#              smoke-tested BEFORE any release.
+#              smoke-tested BEFORE any release. The docker-container builder is
+#              created with a buildkitd.toml that keeps HTTPS but skips peer
+#              verification for the Gitea registry host only (BuildKit's own
+#              container cannot see the internal Dungeon CA; the docker CLI
+#              login DOES verify TLS through it, see Setup Docker buildx).
 #   release -> the (manual) release job pulls it from Gitea and promotes the
 #              same tag to DOCKER HUB.
 #
@@ -430,7 +434,28 @@ jobs:
 
       - name: Setup Docker buildx
         run: |
-          docker buildx create --name multiarch --driver docker-container --use
+          set -euo pipefail
+          # BuildKit performs the registry push from its OWN container: the
+          # docker-container builder has no access to the internal Dungeon CA
+          # installed above (the CA only covers client-side calls made by this
+          # job container, e.g. `docker login`), so it cannot verify the TLS
+          # certificate of the internal registry
+          # ("x509: certificate signed by unknown authority").
+          # A buildkitd.toml passed to `docker buildx create --config` is
+          # mounted into the builder container at start; it KEEPS HTTPS
+          # (http = false) and only skips peer verification for the Gitea
+          # registry host. Docker Hub is never flagged insecure.
+          REGISTRY_HOST="$(printf '%s' "$GITHUB_SERVER_URL" | sed -E 's#^https?://##; s#/$##')"
+          cat > /tmp/buildkitd.toml <<EOF
+          [registry."${REGISTRY_HOST}"]
+            http = false
+            insecure = true
+          EOF
+          # Recreate the builder so a previous run cannot leave a stale
+          # instance that ignores the new config.
+          docker buildx rm multiarch 2>/dev/null || true
+          docker buildx create --name multiarch --driver docker-container \
+            --config /tmp/buildkitd.toml --use
           docker buildx inspect --bootstrap
 
       - name: Checkout repository
