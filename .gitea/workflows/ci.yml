@@ -388,7 +388,10 @@ jobs:
           apk_install_with_retry() {
             local max_attempts=5
             local attempt=1
-            until apk add --no-cache "$@"; do
+            # apk update first (fresh index even when the mirror just flipped);
+            # apk add --no-cache would fetch the index itself, but an explicit
+            # update also covers transient mirror outages before the install.
+            until apk update --quiet && apk add --no-cache "$@"; do
               if [ "$attempt" -ge "$max_attempts" ]; then
                 echo "ERROR: apk add failed after $max_attempts attempts" >&2
                 return 1
@@ -399,7 +402,7 @@ jobs:
             done
           }
 
-          apk_install_with_retry git curl openssl-client docker-cli docker-cli-buildx qemu ca-certificates nodejs
+          apk_install_with_retry git curl openssl docker-cli docker-cli-buildx qemu ca-certificates nodejs
 
           # Register QEMU binfmt handlers for cross-platform builds (arm64)
           docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true

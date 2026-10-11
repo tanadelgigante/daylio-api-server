@@ -29,6 +29,7 @@ Scope    : The CI definition is executable configuration, so it is tested like
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -167,6 +168,16 @@ def test_build_checks_out_the_full_history(workflow: dict) -> None:
     ]
     assert checkouts, "the build job must check out the repository"
     assert checkouts[0]["with"]["fetch-depth"] == 0
+
+
+def test_build_installs_the_alpine_openssl_package(workflow: dict) -> None:
+    """``openssl-client`` does not exist in the Alpine 3.23 repositories (it is
+    a Debian/Fedora-style name); the Alpine package that ships the ``openssl``
+    CLI is simply ``openssl``.
+    """
+    run = _run_text(workflow["jobs"]["build"])
+    assert "openssl-client" not in run
+    assert re.search(r"apk_install_with_retry .*openssl ", run)
 
 
 # --------------------------------------------------------------------------- #
