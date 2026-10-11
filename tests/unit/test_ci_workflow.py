@@ -170,6 +170,30 @@ def test_build_checks_out_the_full_history(workflow: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Runner compatibility: node for actions/checkout (nektos/act issue #107)
+# --------------------------------------------------------------------------- #
+def test_every_checkout_job_provides_node(workflow: dict) -> None:
+    """JS actions (actions/checkout@v4) need node in the job container.
+
+    Alpine and Debian-slim images ship no node, so act and the Gitea runner
+    fail with "exec: node: executable file not found in $PATH" (nektos/act
+    #107) when a job runs ``actions/checkout``. Every job that checks out the
+    repository must install ``nodejs`` (apk on Alpine, apt-get on Debian)
+    before the checkout step.
+    """
+    for name in EXPECTED_JOBS:
+        job = workflow["jobs"][name]
+        uses_checkout = any(
+            str(step.get("uses", "")).startswith("actions/checkout")
+            for step in _steps(job)
+        )
+        if uses_checkout:
+            assert "nodejs" in _run_text(job), (
+                f"job {name!r} uses actions/checkout but never installs node"
+            )
+
+
+# --------------------------------------------------------------------------- #
 # D15 / §11 #7: the release job is MANUAL ONLY
 # --------------------------------------------------------------------------- #
 def test_release_is_never_automatic(workflow: dict) -> None:
