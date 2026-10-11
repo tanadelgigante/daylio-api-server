@@ -5,7 +5,7 @@
 **Data stesura:** 2026-09-22 (aggiornato 2026-09-22: conferme §11, config YAML, APScheduler, rinomina `db/migrations.py`, `vars.INFLUX_INSTANCE`)
 **Autore:** Designer (architetto software)
 **Stato:** **APPROVATO 2026-09-22** — tutti i punti aperti del §11 sono RISOLTI con le conferme dell'utente: D15/D15b immagine e tag, build solo su push, Chart.js, auth sessioni + API key, Influx org `tanadelgigante`/bucket `daylio`/`vars.INFLUX_INSTANCE` per le prove CI, release solo manuale via `workflow_dispatch`, rinomina `db/migrations.py`, scheduler **APScheduler**. Config applicativa migrata da TOML a **YAML** (`PyYAML`, richiesta esplicita dell'utente) con esempi reali `config/config.example.yml` e `config/users.example.yml`.
-**MODIFICA 2026-10-11 (utente):** flusso registry — il job `build` pubblica l'immagine multi-arch sul **registry container di Gitea** (pull per prove prima della release); **Docker Hub viene raggiunto SOLO dal job `release`** (promote dello stesso tag). La `build` è invocabile anche manualmente via `workflow_dispatch job=build` per forzarla anche con `Dockerfile` invariato. **Nota TLS (2026-10-11, risolta in CI):** il push lo esegue il container di BuildKit, che non vede la CA interna Dungeon → `buildx create` con `buildkitd.toml` (`[registry."<host>"] http = false; insecure = true`, scoped SOLO al registry Gitea; `docker login` resta verificato via DUNGEONCACERT nel container job).
+**MODIFICA 2026-10-11 (utente):** flusso registry — il job `build` pubblica l'immagine multi-arch sul **registry container di Gitea** (pull per prove prima della release); **Docker Hub viene raggiunto SOLO dal job `release`** (promote dello stesso tag). La `build` è invocabile anche manualmente via `workflow_dispatch job=build` per forzarla anche con `Dockerfile` invariato. **Nota TLS (2026-10-11, risolta in CI):** il push lo esegue il worker di **BuildKit**, che non vede la CA interna Dungeon → il job costruisce una **immagine BuildKit custom con la CA fusa** (`moby/buildkit` + `COPY dungeon-ca.crt` + `update-ca-certificates`) e crea il builder `docker-container` con `--driver-opt image=buildkit-dungeon:local` (il primo tentativo con `buildkitd.toml insecure=true` NON ha funzionato). TLS resta verificato via DUNGEONCACERT; `docker.io` mai marcato insecure.
 
 ---
 
@@ -476,13 +476,7 @@ Pseudo-flusso operativo (da implementare come step nel job build):
    - funzione `apk_install_with_retry()` (max 5 tentativi, `sleep 5s`, `apk update --quiet` a ogni tentativo) per `git curl openssl docker-cli docker-cli-buildx qemu ca-certificates nodejs`;
    - `docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true` (registra binfmt per arm64);
    - CA interna: `DUNGEONCACERT` (secret) → `/usr/local/share/ca-certificates/dungeon-ca.crt` + `update-ca-certificates` (altrimenti warning).
-2. **Setup Docker buildx** (modifica 2026-10-11 — TLS registry interno): il container di **BuildKit** esegue il push col proprio trust store e NON ha la CA interna Dungeon aggiunta nel container job (il `docker login` invece sì) → `docker buildx create --name multiarch --driver docker-container --config /tmp/buildkitd.toml --use` dove `buildkitd.toml` contiene solo:
-   ```toml
-   [registry."<REGISTRY_HOST da GITHUB_SERVER_URL>"]
-     http = false
-     insecure = true
-   ```
-   (mantiene HTTPS, allenta SOLO la verifica del certificato per quel registry; `docker.io` mai segnato insecure). Il builder viene ricreato a ogni run (`docker buildx rm multiarch ... || true`) così una istanza stale non ignora la config; segue `docker buildx inspect --bootstrap`.
+2. **Setup Docker buildx** (modifica 2026-10-11 — TLS registry interno): il worker di **BuildKit** esegue il push col proprio trust store e NON ha la CA interna Dungeon aggiunta nel container job (il `docker login` invece sì) → il job prima costruisce una **immagine BuildKit custom** (`/tmp/buildkit-ctx/Dockerfile`: `FROM moby/buildkit:latest` + `COPY dungeon-ca.crt` + `update-ca-certificates`; se manca `update-ca-certificates`, fallback `apk add ca-certificates`) e poi crea il builder con `docker buildx create --name multiarch --driver docker-container --driver-opt image=buildkit-dungeon:local --use` (+ `inspect --bootstrap`). Il builder viene ricreato a ogni run (`docker buildx rm multiarch ... || true`) così un worker stale (immagine stock) non viene riusato. **Nota**: il primo tentativo con `buildkitd.toml insecure=true` NON ha funzionato (stesso errore x509) — abbandonato in favore della CA fusa (TLS attivo, `docker.io` mai insecure).
 3. **Checkout**: `actions/checkout@v4` con `fetch-depth: 0` (serve per diff-guard).
 4. **Build and push**:
    - **Guardia idempotenza via diff (solo su push)**: su `push`, `if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "^Dockerfile"; then` → build&push SOLO se il Dockerfile è cambiato nell'ultimo commit; altrimenti `"Dockerfile NON modificato, salto build."` (job passa comunque). Una **`workflow_dispatch job=build`** (modifica 2026-10-11) ignora il diff-guard e forza la build anche con Dockerfile invariato. Non gira mai su PR.
@@ -563,7 +557,7 @@ Pseudo-flusso operativo (da implementare come step nel job build):
 | 8 | `ingestora_migrations.py` | Rinominare in **`db/migrations.py`** | **RISOLTO** |
 | 9 | Scheduler | **APScheduler** (non threading nativo) | **RISOLTO** |
 
-> Nota: la sezione è chiusa; non restano punti aperti su questi aspetti. Eventuali nuove richieste vanno trattate come revisione del WORKPLAN (D12). La **modifica 2026-10-11** sul flusso registry (build → Gitea, Docker Hub al release, build manuale forzabile) è stata approvata dall'utente ed è riflessa in D14/D15/§8.3/§8.4/§10; la **nota TLS** sullo stesso giorno (buildkitd.toml, `insecure = true` scoped al registry Gitea) è riflessa in §8.3 ed è stata risolta in CI (prima build: `x509: certificate signed by unknown authority` → push riuscito dopo il fix).
+> Nota: la sezione è chiusa; non restano punti aperti su questi aspetti. Eventuali nuove richieste vanno trattate come revisione del WORKPLAN (D12). La **modifica 2026-10-11** sul flusso registry (build → Gitea, Docker Hub al release, build manuale forzabile) è stata approvata dall'utente ed è riflessa in D14/D15/§8.3/§8.4/§10; la **nota TLS** sullo stesso giorno è riflessa in §8.3 ed è stata risolta in CI (prima build: `x509: certificate signed by unknown authority` → fix `buildkitd.toml` insufficiente → fix definitivo con immagine BuildKit custom e CA fusa, `--driver-opt image=buildkit-dungeon:local`).
 
 ---
 

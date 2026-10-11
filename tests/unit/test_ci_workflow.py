@@ -213,31 +213,37 @@ def test_build_pushes_to_the_gitea_container_registry(workflow: dict) -> None:
     assert "docker.io" not in run
 
 
-def test_build_tells_buildkit_to_relax_tls_for_the_internal_registry(
-    workflow: dict,
-) -> None:
+def test_build_tells_buildkit_to_trust_the_internal_ca(workflow: dict) -> None:
     """BuildKit performs the push from its OWN container, which cannot see the
     internal Dungeon CA installed in the job container, so the push to the
     internal registry fails with "x509: certificate signed by unknown
-    authority". The builder is created with a buildkitd.toml that keeps HTTPS
-    (``http = false``) and skips peer verification for the Gitea registry host
-    ONLY — Docker Hub is never flagged insecure."""
+    authority". ``docker buildx create --config`` (buildkitd.toml) proved
+    unreliable, so the build job bakes the CA into a custom BuildKit image
+    (``buildkit-dungeon:local``) and creates the docker-container builder with
+    ``--driver-opt image=buildkit-dungeon:local``: TLS stays ENABLED (verified
+    against the Dungeon CA) and Docker Hub is never flagged insecure."""
     setup = [
         step
         for step in _steps(workflow["jobs"]["build"])
-        if step.get("name") == "Setup Docker buildx"
+        if step.get("name") == "Setup Docker buildx (custom BuildKit image with the internal CA)"
     ]
-    assert setup, "missing 'Setup Docker buildx' step"
+    assert setup, "missing the custom BuildKit setup step"
     run = setup[0]["run"]
-    # The config file that lands inside the builder container.
-    assert "buildkitd.toml" in run
-    assert "GITHUB_SERVER_URL" in run
-    assert "http = false" in run
-    assert "insecure = true" in run
-    assert "--config /tmp/buildkitd.toml" in run
-    # The builder is recreated so a stale instance cannot ignore the config.
+    # The CA is baked into a custom buildkit image used as the worker image.
+    assert "DUNGEON_CA" in setup[0].get("env", {})
+    assert "buildkit-dungeon:local" in run
+    assert "--driver-opt image=buildkit-dungeon:local" in run
+    assert "docker build -t buildkit-dungeon:local" in run
+    # The stock builder is recreated every run so a stale container built from
+    # the stock image is never reused.
     assert "docker buildx rm multiarch" in run
-    # The relaxation is scoped: docker.io must not appear in the buildkitd.toml.
+    assert "docker buildx create --name multiarch --driver docker-container" in run
+    assert "moby/buildkit" in run
+    # HTTPS/trust is kept for the internal registry via the CA; no `insecure`
+    # registry flag may be introduced (it would also weaken Docker Hub). The
+    # word "buildkitd.toml" may still appear in a comment explaining the
+    # abandoned approach, but never as an active config.
+    assert "insecure = true" not in run
     assert "docker.io" not in run
 
 

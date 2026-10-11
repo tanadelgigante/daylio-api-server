@@ -304,13 +304,15 @@ The Gitea Actions workflow (`ci.yml`) builds and publishes a multi-arch image
 
 `docker login` succeeds because the job container trusts the internal Dungeon
 CA (`DUNGEONCACERT` -> `update-ca-certificates`). The actual push, however, is
-performed **by the BuildKit builder container**, whose trust store does not
+performed **by the BuildKit worker container**, whose trust store does not
 include that CA — without a fix the build fails with `x509: certificate signed
-by unknown authority`. The build job therefore creates the builder with a
-`buildkitd.toml` that keeps HTTPS (`http = false`) and skips peer verification
-for the Gitea registry host **only** (`insecure = true`); the builder is
-recreated on every run so a stale instance cannot ignore the config. Docker Hub
-is never flagged insecure.
+by unknown authority`. The build job therefore builds a **custom BuildKit image
+(`buildkit-dungeon:local`) with the CA baked in** (`FROM moby/buildkit` +
+`COPY dungeon-ca.crt` + `update-ca-certificates`) and creates the
+docker-container builder with `--driver-opt image=buildkit-dungeon:local`;
+TLS stays enabled and Docker Hub is never flagged insecure. The builder is
+recreated on every run so a stale worker built from the stock image is never
+reused.
 
 ## Troubleshooting
 
