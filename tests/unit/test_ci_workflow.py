@@ -8,10 +8,13 @@ Scope    : The CI definition is executable configuration, so it is tested like
 
               D9/D14 : the six jobs of §8.2 exist with the documented
                        dependencies; ``[skip-ci]`` gates lint/test/build;
-              D14    : the ``build`` job runs ONLY on ``push`` (never on a
-                       pull_request), diff-guards the Dockerfile, uses buildx
-                       for ``linux/amd64,linux/arm64`` and never puts a
-                       password on the command line;
+              D14    : the ``build`` job runs on ``push`` or on a manual
+                       ``workflow_dispatch job=build`` (which forces the build
+                       even when the Dockerfile is unchanged), never on a
+                       pull_request, diff-guards the Dockerfile on push, uses
+                       buildx for ``linux/amd64,linux/arm64`` and never puts a
+                       password on the command line; the artifact goes to the
+                       GITEA container registry, not to Docker Hub;
               D15    : image/tag fallbacks (vars.IMAGE_REPO, version.ini,
                        vars.APP_VERSION, matrix.tag);
               §8.2   : ``release`` is reachable ONLY through
@@ -114,10 +117,22 @@ def test_lint_and_test_are_gated_by_should_skip(workflow: dict) -> None:
 # --------------------------------------------------------------------------- #
 # D14 / D15: the build job
 # --------------------------------------------------------------------------- #
-def test_build_runs_only_on_push(workflow: dict) -> None:
+def test_build_runs_on_push_or_manual_dispatch(workflow: dict) -> None:
     condition = workflow["jobs"]["build"]["if"]
     assert "github.event_name == 'push'" in condition
+    assert "github.event.inputs.job == 'build'" in condition
     assert "pull_request" not in condition
+
+
+def test_manual_dispatch_forces_the_build_with_unchanged_dockerfile(
+    workflow: dict,
+) -> None:
+    """The Dockerfile diff-guard applies to pushes only; a manual
+    ``workflow_dispatch job=build`` skips the guard and forces the build."""
+    run = _run_text(workflow["jobs"]["build"])
+    assert "NOT modified, skipping build" in run
+    assert 'github.event_name' in run
+    assert "job=build" in run
 
 
 def test_build_is_gated_by_both_skip_tokens(workflow: dict) -> None:
@@ -180,6 +195,24 @@ def test_build_installs_the_alpine_openssl_package(workflow: dict) -> None:
     assert re.search(r"apk_install_with_retry .*openssl ", run)
 
 
+def test_build_pushes_to_the_gitea_container_registry(workflow: dict) -> None:
+    """User decision 2026-10-11: the build artifact goes to the Gitea
+    container registry (so it can be smoke-tested before any release), never
+    to Docker Hub. Credentials: DUNGEONPAT via stdin, no DOCKER_* secrets."""
+    run = _run_text(workflow["jobs"]["build"])
+    assert "GITHUB_SERVER_URL" in run
+    assert "docker login --username" in run
+    assert "GITHUB_ACTOR" in run
+    assert "--password-stdin" in run
+    assert "DUNGEONPAT" in run
+    assert "--platform linux/amd64,linux/arm64" in run
+    assert "--push" in run
+    # Docker Hub is strictly out of scope for the build job.
+    assert "DOCKER_USERNAME" not in run
+    assert "DOCKER_PASSWORD" not in run
+    assert "docker.io" not in run
+
+
 # --------------------------------------------------------------------------- #
 # Runner compatibility: node for actions/checkout (nektos/act issue #107)
 # --------------------------------------------------------------------------- #
@@ -229,6 +262,25 @@ def test_release_creates_the_release_and_bumps_the_version(workflow: dict) -> No
 
 def test_release_has_write_permission(workflow: dict) -> None:
     assert workflow["jobs"]["release"]["permissions"]["contents"] == "write"
+
+
+def test_release_promotes_the_image_to_docker_hub(workflow: dict) -> None:
+    """User decision 2026-10-11: Docker Hub is reached ONLY at release time.
+    The release job pulls the tag from the Gitea registry and re-pushes the
+    same tag to Docker Hub (docker.io / vars.IMAGE_REPO)."""
+    run = _run_text(workflow["jobs"]["release"])
+    assert "docker pull" in run
+    assert "docker tag" in run
+    assert "docker push" in run
+    # Pull side (Gitea): DUNGEONPAT.
+    assert "DUNGEONPAT" in run
+    assert "GITHUB_ACTOR" in run
+    # Push side (Docker Hub): DOCKER_* secrets + image from vars.IMAGE_REPO.
+    assert "DOCKER_USERNAME" in run
+    assert "DOCKER_PASSWORD" in run
+    assert "IMAGE_REPO" in run
+    assert "tanadelgigante/daylio-api-server" in run
+    assert "--password-stdin" in run
 
 
 # --------------------------------------------------------------------------- #

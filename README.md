@@ -211,6 +211,17 @@ Dependencies are locked in `requirements.lock` (pip-tools); the Docker build
 installs only that file, and CI verifies it is still in sync with
 `requirements.in`.
 
+## CI and image registries
+
+Gitea Actions builds a multi-arch image (`linux/amd64,linux/arm64`) with a
+two-registry flow: the `build` job pushes to the **Gitea container registry**
+(run it on any push that touches the `Dockerfile`, or force it with a manual
+`workflow_dispatch job=build`), and the **manual `release` job** promotes the
+same tag to **Docker Hub** (`tanadelgigante/daylio-api-server`, override
+`vars.IMAGE_REPO`) before creating the Gitea release. Pull and smoke-test the
+image from the Gitea registry before releasing — see
+[OPERATIONS.md](docs/OPERATIONS.md#ci-and-image-registries).
+
 ## Documentation
 
 | Document | Contents |

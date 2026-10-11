@@ -273,6 +273,33 @@ connection and run it again.
   is in sync with `requirements.in`. Rebuild the image after every upgrade
   (`docker compose up -d --build`).
 
+## CI and image registries
+
+The Gitea Actions workflow (`ci.yml`) builds and publishes a multi-arch image
+(`linux/amd64,linux/arm64`) with this **two-registry flow**:
+
+1. **Build -> Gitea container registry.** The `build` job pushes the image to
+   `$GITHUB_SERVER_URL` host / `<owner>/<repo>` (login with the `DUNGEONPAT`
+   secret via stdin). It runs automatically on `push` when the previous commit
+   touched the `Dockerfile`, and can always be forced with a manual
+   `workflow_dispatch job=build` dispatch. Pull and smoke-test this image
+   before releasing:
+   ```sh
+   docker pull <gitea-host>/tanadelgigante/daylio-api-server:v2.0.0
+   docker run --rm -p 3177:5000 \
+     -e ADMIN_USERNAME=admin -e ADMIN_PASSWORD=<pwd> \
+     -e INFLUX_URL=http://192.168.188.120:8120 -e INFLUX_TOKEN=<token> \
+     -e INFLUX_ORG=tanadelgigante -e INFLUX_BUCKET=daylio \
+     <gitea-host>/tanadelgigante/daylio-api-server:v2.0.0
+   ```
+2. **Release -> Docker Hub (manual only).** The `release` job (reachable ONLY
+   through `workflow_dispatch job=release`) pulls that tag from the Gitea
+   registry, re-tags it to the Docker Hub image (`tanadelgigante/daylio-api-server`,
+   override `vars.IMAGE_REPO`) and pushes it with the release-only secrets
+   `DOCKER_USERNAME`/`DOCKER_PASSWORD` (registry `vars.DOCKER_REGISTRY`,
+   default `docker.io`). It then creates the Gitea release and bumps
+   `version.ini`. A push or tag push never triggers a release.
+
 ## Troubleshooting
 
 | Symptom | Cause | Action |

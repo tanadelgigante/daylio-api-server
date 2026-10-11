@@ -18,10 +18,17 @@
 #
 # Required repository configuration (Settings -> Actions):
 #   vars:    DNS, NTFY_URL, NTFY_TOPIC, INFLUX_INSTANCE ("<ip>:<port>"),
-#            IMAGE_REPO (default tanadelgigante/daylio-api-server),
-#            APP_VERSION, DOCKER_REGISTRY (default docker.io)
-#   secrets: DUNGEONCACERT, DOCKER_USERNAME, DOCKER_PASSWORD, INFLUX_TOKEN,
-#            DUNGEONPAT
+#            IMAGE_REPO (Docker Hub image, default tanadelgigante/daylio-api-server),
+#            APP_VERSION, DOCKER_REGISTRY (Docker Hub, default docker.io)
+#   secrets: DUNGEONCACERT, INFLUX_TOKEN, DUNGEONPAT,
+#            DOCKER_USERNAME, DOCKER_PASSWORD (release ONLY: Docker Hub promote)
+#
+# Registry flow (user decision 2026-10-11):
+#   build   -> the multi-arch image is pushed to the GITEA container registry
+#              ($GITHUB_SERVER_URL host / owner/repo), so it can be pulled and
+#              smoke-tested BEFORE any release.
+#   release -> the (manual) release job pulls it from Gitea and promotes the
+#              same tag to DOCKER HUB.
 #
 # Commit-message tokens (R9 / D9):
 #   [skip-ci]  skips lint, test, build and release (flatpress convention)
@@ -50,7 +57,7 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: 'release: publish v<version.ini without -SNAPSHOT> and bump version.ini'
+        description: 'release: promote to Docker Hub + publish release and bump version.ini | build: force a build even with an unchanged Dockerfile'
         required: true
         default: 'release'
       release_notes:
@@ -336,12 +343,18 @@ jobs:
             python -m pytest -q -m "not influx"
           fi
 
-  # ── Job 3: build & push the multi-arch image (push events only) ─────────
+  # ── Job 3: build & push the multi-arch image (push OR manual job=build) ─
   # Pattern infrastructure-tools §8.3: alpine + docker-cli/buildx + QEMU +
-  # custom CA, buildx multiarch, diff-guard on the Dockerfile, tag from
-  # version.ini with vars.APP_VERSION / matrix.tag fallbacks (D15b).
+  # custom CA, buildx multiarch, tag from version.ini with vars.APP_VERSION /
+  # matrix.tag fallbacks (D15b). The Dockerfile diff-guard applies to pushes
+  # only; a manual ``workflow_dispatch job=build`` forces the build even with
+  # an unchanged Dockerfile. The artifact goes to the GITEA container
+  # registry, NOT to Docker Hub (Docker Hub is promoted at release time).
   build:
-    if: github.event_name == 'push' && needs.ci-skip-check.outputs.should_skip != 'true' && needs.ci-skip-check.outputs.skip_build != 'true'
+    if: >-
+      needs.ci-skip-check.outputs.should_skip != 'true' &&
+      ( (github.event_name == 'push' && needs.ci-skip-check.outputs.skip_build != 'true') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'build') )
     needs: [ci-skip-check]
     runs-on: local
     container:
@@ -425,10 +438,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build and push ${{ matrix.image_repo }}
+      - name: Build and push ${{ github.repository }} to the Gitea registry
         env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DUNGEONPAT: ${{ secrets.DUNGEONPAT }}
         run: |
           set -e
           DOCKERFILE="${{ matrix.dockerfile }}"
@@ -436,16 +448,16 @@ jobs:
 
           echo "Checking whether ${DOCKERFILE} has been modified..."
 
-          if ! git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "^${DOCKERFILE}"; then
+          if [ "${{ github.event_name }}" = "push" ] && \
+             ! git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "^${DOCKERFILE}"; then
             echo "${DOCKERFILE} NOT modified, skipping build (job stays green)."
+            echo "Use a manual dispatch (job=build) to force a build with an unchanged Dockerfile."
             exit 0
           fi
 
-          echo "${DOCKERFILE} modified, proceeding with the multi-arch build."
+          echo "${DOCKERFILE} modified (or forced run), proceeding with the multi-arch build."
 
           # Tag resolution (D15b): version.ini -> vars.APP_VERSION -> matrix.tag.
-          IMAGE_REPO_EFFECTIVE="${IMAGE_REPO:-${{ matrix.image_repo }}}"
-          REGISTRY="${DOCKER_REGISTRY:-docker.io}"
           RAW_VERSION="$(tr -d '[:space:]' < version.ini 2>/dev/null || true)"
           VERSION="${RAW_VERSION#v}"
           VERSION="${VERSION%-SNAPSHOT}"
@@ -457,26 +469,32 @@ jobs:
             TAG="${{ matrix.tag }}"
           fi
 
-          echo "Using build context: ${CONTEXT}"
-          echo "Building and pushing ${IMAGE_REPO_EFFECTIVE}:${TAG} (linux/amd64,linux/arm64) to ${REGISTRY}..."
+          # The artifact lives in the Gitea CONTAINER registry so it can be
+          # pulled and smoke-tested before any release; Docker Hub is reached
+          # only by the (manual) release job, which promotes this same tag.
+          REGISTRY_HOST="$(printf '%s' "$GITHUB_SERVER_URL" | sed -E 's#^https?://##; s#/$##')"
+          GITEA_IMAGE="${REGISTRY_HOST}/${{ github.repository }}"
 
-          if [ -z "${DOCKER_USERNAME:-}" ] || [ -z "${DOCKER_PASSWORD:-}" ]; then
-            echo "ERROR: Docker credentials not set"
+          echo "Using build context: ${CONTEXT}"
+          echo "Building and pushing ${GITEA_IMAGE}:${TAG} (linux/amd64,linux/arm64) to the Gitea registry ${REGISTRY_HOST}..."
+
+          if [ -z "${DUNGEONPAT:-}" ]; then
+            echo "ERROR: Secret DUNGEONPAT is required to push to the Gitea registry"
             exit 1
           fi
 
-          echo "$DOCKER_PASSWORD" | docker login --username "$DOCKER_USERNAME" --password-stdin "$REGISTRY"
+          echo "$DUNGEONPAT" | docker login --username "$GITHUB_ACTOR" --password-stdin "$REGISTRY_HOST"
 
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
             ${{ matrix.build_args }} \
-            -t "${IMAGE_REPO_EFFECTIVE}:${TAG}" \
+            -t "${GITEA_IMAGE}:${TAG}" \
             -f "$DOCKERFILE" \
             "$CONTEXT" \
             --push
 
           echo "TAG=${TAG}" >> "$GITHUB_ENV"
-          echo "✅ ${IMAGE_REPO_EFFECTIVE}:${TAG} pushed successfully (multi-arch)"
+          echo "✅ ${GITEA_IMAGE}:${TAG} pushed successfully (multi-arch)"
 
   # ── Job 4: release (MANUAL only — never on push, never on tag) ──────────
   # Flatpress pattern: workflow_dispatch with job=release creates the Gitea
@@ -518,10 +536,10 @@ jobs:
           done
           echo "Configured /etc/resolv.conf with resolvers: $INTERNAL_DNS"
 
-      - name: Install tooling (git, curl, jq, python3)
+      - name: Install tooling (git, curl, jq, python3, docker)
         run: |
           sed -i 's#^https://#http://#' /etc/apk/repositories
-          apk add --no-cache ca-certificates git curl jq python3 nodejs
+          apk add --no-cache ca-certificates git curl jq python3 nodejs docker-cli
           sed -i 's#^http://#https://#' /etc/apk/repositories
 
       - name: Trust the Gitea CA
@@ -552,6 +570,37 @@ jobs:
           VERSION="${VERSION%-SNAPSHOT}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Release version: $VERSION (from version.ini)"
+
+      - name: Promote image to Docker Hub
+        env:
+          DUNGEONPAT: ${{ secrets.DUNGEONPAT }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve_version.outputs.version }}"
+
+          # Pull the tag previously built by the build job (Gitea registry).
+          if [ -z "${DUNGEONPAT:-}" ]; then
+            echo "::error::Secret DUNGEONPAT is required to pull from the Gitea registry" >&2
+            exit 1
+          fi
+          REGISTRY_HOST="$(printf '%s' "$GITHUB_SERVER_URL" | sed -E 's#^https?://##; s#/$##')"
+          GITEA_IMAGE="${REGISTRY_HOST}/${{ github.repository }}"
+          echo "$DUNGEONPAT" | docker login --username "$GITHUB_ACTOR" --password-stdin "$REGISTRY_HOST"
+          docker pull "${GITEA_IMAGE}:${TAG}"
+
+          # Promote the exact same tag to Docker Hub (release-only credentials).
+          if [ -z "${DOCKER_USERNAME:-}" ] || [ -z "${DOCKER_PASSWORD:-}" ]; then
+            echo "::error::Secrets DOCKER_USERNAME/DOCKER_PASSWORD are required for Docker Hub" >&2
+            exit 1
+          fi
+          DOCKER_IMAGE="${IMAGE_REPO:-tanadelgigante/daylio-api-server}"
+          REGISTRY="${DOCKER_REGISTRY:-docker.io}"
+          echo "$DOCKER_PASSWORD" | docker login --username "$DOCKER_USERNAME" --password-stdin "$REGISTRY"
+          docker tag "${GITEA_IMAGE}:${TAG}" "${DOCKER_IMAGE}:${TAG}"
+          docker push "${DOCKER_IMAGE}:${TAG}"
+          echo "✅ ${DOCKER_IMAGE}:${TAG} promoted to Docker Hub"
 
       - name: Create Gitea release
         env:

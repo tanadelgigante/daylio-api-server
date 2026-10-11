@@ -5,6 +5,7 @@
 **Data stesura:** 2026-09-22 (aggiornato 2026-09-22: conferme §11, config YAML, APScheduler, rinomina `db/migrations.py`, `vars.INFLUX_INSTANCE`)
 **Autore:** Designer (architetto software)
 **Stato:** **APPROVATO 2026-09-22** — tutti i punti aperti del §11 sono RISOLTI con le conferme dell'utente: D15/D15b immagine e tag, build solo su push, Chart.js, auth sessioni + API key, Influx org `tanadelgigante`/bucket `daylio`/`vars.INFLUX_INSTANCE` per le prove CI, release solo manuale via `workflow_dispatch`, rinomina `db/migrations.py`, scheduler **APScheduler**. Config applicativa migrata da TOML a **YAML** (`PyYAML`, richiesta esplicita dell'utente) con esempi reali `config/config.example.yml` e `config/users.example.yml`.
+**MODIFICA 2026-10-11 (utente):** flusso registry — il job `build` pubblica l'immagine multi-arch sul **registry container di Gitea** (pull per prove prima della release); **Docker Hub viene raggiunto SOLO dal job `release`** (promote dello stesso tag). La `build` è invocabile anche manualmente via `workflow_dispatch job=build` per forzarla anche con `Dockerfile` invariato.
 
 ---
 
@@ -112,9 +113,9 @@ L'obiettivo è un'**evoluzione completa** che trasformi il progetto in un serviz
 
 ---
 
-- **D14 — Workflow CI completo: job build&push Docker multi-arch (NOVITÀ, Integrazione 2, CONFERMATO 2026-09-22).** Il `.gitea/workflows/ci.yml` combina **FLUSSO FLATPRESS** (gate `[skip-ci]`, lint ruff, pytest, release su `workflow_dispatch` — **sempre manuale, MAI su tag**, bump `version.ini`, notify) con **FLUSSO INFRASTRUCTURE-TOOLS** (job `build` **solo su push**, guardia `[skip]` sul commit, container `alpine:3.23`, `strategy.matrix` con `fail-fast:false`, buildx multi-arch `linux/amd64,linux/arm64` con `--push`, login docker via stdin, guardia CA interna `DUNGEONCACERT`, checkout `fetch-depth:0`). Schema dei job in §8.2.
-- **D15 — Immagine Docker pubblicata (CONFERMATO 2026-09-22).**
-  - **D15.a** Immagine: `daylio-api-server` su registro `docker.io` (**default confermato** `tanadelgigante/daylio-api-server`, sovrascrivibile con `vars.IMAGE_REPO`).
+- **D14 — Workflow CI completo: job build&push Docker multi-arch (NOVITÀ, Integrazione 2, CONFERMATO 2026-09-22; aggiornato 2026-10-11).** Il `.gitea/workflows/ci.yml` combina **FLUSSO FLATPRESS** (gate `[skip-ci]`, lint ruff, pytest, release su `workflow_dispatch` — **sempre manuale, MAI su tag**, bump `version.ini`, notify) con **FLUSSO INFRASTRUCTURE-TOOLS** (job `build` su **push** o **`workflow_dispatch job=build`** — quest'ultima forza la build anche con Dockerfile invariato, guardia `[skip]` sul commit, container `alpine:3.23`, `strategy.matrix` con `fail-fast:false`, buildx multi-arch `linux/amd64,linux/arm64` con `--push`, login docker via stdin, guardia CA interna `DUNGEONCACERT`, checkout `fetch-depth:0`). Schema dei job in §8.2.
+- **D15 — Immagine Docker pubblicata (CONFERMATO 2026-09-22; flusso registry aggiornato 2026-10-11).**
+  - **D15.a** Immagine: `daylio-api-server`. **Flusso registry (MODIFICA 2026-10-11):** il job `build` pubblica sul **registry container di Gitea** (`$GITHUB_SERVER_URL` host / `<owner>/<repo>`, login con `DUNGEONPAT` via stdin) — l'utente può fare pull e prove prima della release. Solo il job **`release`** (manuale) fa il **promote a Docker Hub**: pull dal registry Gitea + `docker tag` + `docker push` su `docker.io` (`tanadelgigante/daylio-api-server`, sovrascrivibile con `vars.IMAGE_REPO`; credenziali `DOCKER_USERNAME`/`DOCKER_PASSWORD` di release).
   - **D15.b Tag**: derivato da `version.ini` → `v<version>` (es. `v2.0.0`), fallback `vars.APP_VERSION`, fallback `matrix.tag`/`github.run_number`. **CONFERMATO**.
 - **D16 — Notifica unica Ntfy** sul pattern infrastructure-tools (job `notify`, `if: always()`, `needs: [build]`, guardia su `NTFY_URL`/`NTFY_TOPIC`, mapping success/failure/cancelled). (Complementare al notify flatpress multi-job.) **CONFERMATO 2026-09-22**.
 
@@ -345,8 +346,9 @@ logging:
 | `INFLUX_INSTANCE` | **CI/test** piuttosto che URL completo: `vars.INFLUX_INSTANCE="<ip>:<port>"` (es. `192.168.188.120:8120`) → il job `test` costruisce `INFLUX_URL="http://${INFLUX_INSTANCE}"` (D18) |
 | `LOG_LEVEL` | Soglia logging (`DEBUG`/`INFO`; WARN/ERROR/FATAL sempre attivi) |
 | `DATA_DIR` / `DB_PATH` | Path data/db (default `data/`, `data/daylio.db`) |
-| `DOCKER_REGISTRY`, `DOCKER_USERNAME`, `DOCKER_PASSWORD` | Credenziali registry per CI build (solo CI, non app) |
-| `IMAGE_REPO`, `APP_VERSION` | Nome immagine e tag per CI (vars) |
+| `DOCKER_REGISTRY` (default `docker.io`), `DOCKER_USERNAME`, `DOCKER_PASSWORD` | Credenziali **Docker Hub** usate SOLO dal job `release` per il promote dell'immagine (solo CI, non app) |
+| `DUNGEONPAT` | PAT per il registry container Gitea (job `build` push e `release` pull) e per la creazione release |
+| `IMAGE_REPO`, `APP_VERSION` | Nome immagine **Docker Hub** e tag per CI (vars) |
 | `NTFY_URL`, `NTFY_TOPIC` | Notifiche Ntfy (vars) |
 
 ---
@@ -460,8 +462,8 @@ logging:
 | 0 | `ci-skip-check` | — | — | Calcola `should_skip`: `[skip-ci]` nel commit/PR (flatpress pattern); `workflow_dispatch` mai skippato |
 | 1 | `lint` | `ci-skip-check` | `should_skip != 'true'` | `ruff check .` (container python) |
 | 2 | `test` | `ci-skip-check` | `should_skip != 'true'` | `pytest` (container python, fixture sample reali). **Per i test di integrazione Influx**: costruisce `INFLUX_URL="http://${INFLUX_INSTANCE}"` dove `INFLUX_INSTANCE` è `vars.INFLUX_INSTANCE` (`<ip>:<port>`, es. `192.168.188.120:8120`); org/bucket/token da env/secret (D18). Se `INFLUX_INSTANCE` non impostata, i test integrazione Influx vengono skippati (solo unit) |
-| 3 | `build` | `ci-skip-check` | `should_skip != 'true'` + guardia `[skip]`/`[skip-ci]` sul commit + **diff-guard Dockerfile** + **solo `github.event_name == 'push'`** (confermato) | **Build&push immagine Docker multi-arch** (pattern infrastructure-tools §8.3) |
-| 4 | `release` (manuale) | `lint, test, ci-skip-check` | **SOLO `workflow_dispatch job=release`** (confermato: mai automatica su push/tag) | Crea release Gitea + bump `version.ini` (flatpress pattern) |
+| 3 | `build` | `ci-skip-check` | `should_skip != 'true'` + (`push` con `skip_build != 'true'` **oppure** `workflow_dispatch job=build` — forza la build anche con Dockerfile invariato) + **diff-guard Dockerfile solo su push** (mai su PR) | **Build&push immagine Docker multi-arch sul registry container Gitea** (pattern infrastructure-tools §8.3, modifica 2026-10-11) |
+| 4 | `release` (manuale) | `lint, test, ci-skip-check` | **SOLO `workflow_dispatch job=release`** (confermato: mai automatica su push/tag) | **Promote immagine a Docker Hub** (pull da registry Gitea → tag → push) + crea release Gitea + bump `version.ini` (flatpress pattern) (modifica 2026-10-11) |
 | 5 | `notify` | tutti (`always()`) | — | Notifica Ntfy unica (pattern infrastructure-tools+flatpress) |
 
 **Nota sui container di job**: nel flusso infrastructure-tools i job girano in `alpine:3.23` con toolchain installata via `apk_install_with_retry`; nel nostro workflow i job `lint`/`test` (Python) possono usare un container `python:3.12-slim` (più lean per pip/pytest/ruff), mentre `build` (Docker buildx multi-arch) usa `alpine:3.23` con `docker-cli`, `docker-cli-buildx`, `qemu`, `git`, `curl`, `ca-certificates` (come da riferimento). Il CI del nuovo progetto è da considerarsi **completo**: nessun job opzionale "tralasciato".
@@ -477,13 +479,14 @@ Pseudo-flusso operativo (da implementare come step nel job build):
 2. **Setup Docker buildx**: `docker buildx create --name multiarch --driver docker-container --use` + `docker buildx inspect --bootstrap`.
 3. **Checkout**: `actions/checkout@v4` con `fetch-depth: 0` (serve per diff-guard).
 4. **Build and push**:
-   - **Guardia idempotenza via diff**: `if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "^Dockerfile"; then` → build&push SOLO se il Dockerfile è cambiato nell'ultimo commit; altrimenti `"Dockerfile NON modificato, salto build."` (job passa comunque).
-   - **Solo su push** (confermato 2026-09-22): il job `build` ha condizione `github.event_name == 'push'` — non gira su PR.
+   - **Guardia idempotenza via diff (solo su push)**: su `push`, `if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q "^Dockerfile"; then` → build&push SOLO se il Dockerfile è cambiato nell'ultimo commit; altrimenti `"Dockerfile NON modificato, salto build."` (job passa comunque). Una **`workflow_dispatch job=build`** (modifica 2026-10-11) ignora il diff-guard e forza la build anche con Dockerfile invariato. Non gira mai su PR.
+   - **Registry: Gitea container registry (modifica 2026-10-11)** — il job `build` pubblica su `$GITHUB_SERVER_URL` host / `<owner>/<repo>` (pull per prove pre-release). **Docker Hub solo al release.**
    - **Tag**: `version` da `version.ini` (strip `-SNAPSHOT`) → `TAG="v${version}"`; **fallback** `vars.APP_VERSION` → `v$APP_VERSION`; **ultimo fallback** `matrix.tag` (run_number). — *decisione D15b CONFERMATA 2026-09-22*
-   - **Credenziali**: `if [ -z "$DOCKER_USERNAME" ] || [ -z "$DOCKER_PASSWORD" ]; then exit 1; fi`.
-   - **Login**: `echo "$DOCKER_PASSWORD" | docker login --username "$DOCKER_USERNAME" --password-stdin "$DOCKER_REGISTRY"` (mai credenziali in argomento).
-   - **Build multi-arch con push**: `docker buildx build --platform linux/amd64,linux/arm64 -t "$IMAGE:${TAG}" -f Dockerfile . --push` (con `${{ matrix.build_args }}` se presenti).
-   - Output finale: `"✅ daylio-api-server:${TAG} pushed successfully (multi-arch)"`.
+   - **Credenziali build**: `if [ -z "$DUNGEONPAT" ]; then exit 1; fi` (richiesto per il registry Gitea).
+   - **Login build**: `echo "$DUNGEONPAT" | docker login --username "$GITHUB_ACTOR" --password-stdin "$REGISTRY_HOST"` (mai credenziali in argomento).
+   - **Build multi-arch con push**: `docker buildx build --platform linux/amd64,linux/arm64 -t "$GITEA_IMAGE:${TAG}" -f Dockerfile . --push` (con `${{ matrix.build_args }}` se presenti).
+   - **Release — promote a Docker Hub (modifica 2026-10-11)**: `docker pull "$GITEA_IMAGE:$TAG"` → `docker login docker.io` con `DOCKER_USERNAME`/`DOCKER_PASSWORD` (stdin) → `docker tag` → `docker push "$DOCKER_IMAGE:$TAG"` (default `tanadelgigante/daylio-api-server`, override `vars.IMAGE_REPO`).
+   - Output finale build: `"✅ <gitea-image>:${TAG} pushed successfully (multi-arch)"`.
 
 > **Dockerfile multi-stage**: il Dockerfile del progetto (già previsto in Fase 0/Task 0.6) deve essere multi-stage: stage di **build** (installa `pip-tools`, risolve `requirements.lock`, genera venv) + stage di **runtime** (immagine python slim, copia venv, CMD `waitress-serve`). Il job `build` costruisce questo Dockerfile dalla root del repo (`context: "."`).
 
@@ -491,14 +494,15 @@ Pseudo-flusso operativo (da implementare come step nel job build):
 
 | # | Scenario | Job attesi | Note |
 | --- | --- | --- | --- |
-| 1 | Push su main di commit normale senza token | `ci-skip-check` false → `lint`, `test` eseguiti; `build` eseguito (solo push; se `Dockerfile` cambiato: push immagine; altrimenti skip build con job verde); `release` no; `notify` OK | Copre il caso di commit con modifiche al Dockerfile |
+| 1 | Push su main di commit normale senza token | `ci-skip-check` false → `lint`, `test` eseguiti; `build` eseguito (su push; se `Dockerfile` cambiato: push immagine sul registry Gitea; altrimenti skip build con job verde); `release` no; `notify` OK | Copre il caso di commit con modifiche al Dockerfile |
 | 2 | Push su main di commit con `[skip-ci]` (o `[skip]` nel commit per il job `build`) | `ci-skip-check` → skip di lint/test/build/release; `notify` ne dà conto (skipped) | Verifica la convenzione token (flatpress/infrastructure) |
-| 3 | `pull_request` | `ci-skip-check` (PR: titolo/commit head `[skip-ci]`) → `lint`+`test` eseguiti (o skip se token); **`build` MAI eseguito su PR** (confermato 2026-09-22) | Comportamento confermato: build solo su push |
+| 3 | `pull_request` | `ci-skip-check` (PR: titolo/commit head `[skip-ci]`) → `lint`+`test` eseguiti (o skip se token); **`build` MAI eseguito su PR** (confermato 2026-09-22) | Comportamento confermato: build su push |
 | 4 | Push di tag `v*` | `lint`+`test` eseguiti (o skip); `build` eseguito se Dockerfile cambiato; **`release` MAI automatica su tag** (confermato 2026-09-22) | Release solo via `workflow_dispatch job=release` |
-| 5 | `workflow_dispatch job=release` | Mai skippato; `release` crea release con version da `version.ini` | Flatpress pattern; **unica via di release** (manuale) |
-| 6 | Dockerfile modificato nell'ultimo commit | `build` esegue buildx multi-arch + push | Diff-guard `HEAD~1..HEAD` |
-| 7 | Dockerfile NON modificato | `build` esce con "NON modificato, salto build", job verde | Idempotenza |
+| 5 | `workflow_dispatch job=release` | Mai skippato; `release` fa il promote a Docker Hub + crea release con version da `version.ini` e bump | Flatpress pattern; **unica via di release** (manuale) |
+| 6 | Dockerfile modificato nell'ultimo commit | `build` esegue buildx multi-arch + push sul registry Gitea | Diff-guard `HEAD~1..HEAD` (solo su push) |
+| 7 | Dockerfile NON modificato | su push: `build` esce con "NON modificato, salto build", job verde; con `workflow_dispatch job=build` la build viene FORZATA (modifica 2026-10-11) | Idempotenza su push + override manuale |
 | 8 | Job `test` con integrazione Influx | `test` costruisce `INFLUX_URL="http://${INFLUX_INSTANCE}"` da `vars.INFLUX_INSTANCE` (es. `192.168.188.120:8120`); org `tanadelgigante`, bucket `daylio`, token da secret; se `INFLUX_INSTANCE` non impostata → integrazione skippata, solo unit test | D18 — verifica su repo Gitea con vars/secret configurati |
+| 9 | `workflow_dispatch job=build` | Forza il job `build` (anche senza modifiche al Dockerfile) → push multi-arch sul registry Gitea per prove pre-release | Modifica 2026-10-11: test manuale dell'immagine prima della release |
 
 ---
 
@@ -532,7 +536,7 @@ Pseudo-flusso operativo (da implementare come step nel job build):
 3. **Flusso import unificato** verificato sui sample reali: import CSV e `.daylio` producono gli stessi record; BOM gestito; 2 giorni duplicati normalizzati a 1 record (più recente); mood count attesi; 58 scale Stress estratte; scala salute estratta da activities/tags.
 4. **Influx**: punti giornalieri scritti con overwrite completo; dashboard legge SOLO da Influx (R4); job di resync disponibile.
 5. **API**: parametrica (selezione colonne + filtri), retrocompatibile con `/users` e `/moods` legacy.
-6. **CI completa**: job `ci-skip-check`, `lint` (ruff), `test` (pytest, integrazione Influx via `vars.INFLUX_INSTANCE`), `build` (buildx multi-arch push `linux/amd64,linux/arm64` — **solo su push**), `release` (**solo manuale via `workflow_dispatch`, mai su tag**), `notify` (Ntfy); matrice di test §8.4 verde; push immagine `daylio-api-server` avvenuto (o skip documentato se Dockerfile invariato).
+6. **CI completa**: job `ci-skip-check`, `lint` (ruff), `test` (pytest, integrazione Influx via `vars.INFLUX_INSTANCE`), `build` (buildx multi-arch push `linux/amd64,linux/arm64` su **push** o **`workflow_dispatch job=build`** → **registry container Gitea**, modifica 2026-10-11), `release` (**solo manuale via `workflow_dispatch`, mai su tag**; **promote a Docker Hub**), `notify` (Ntfy); matrice di test §8.4 verde; push immagine avvenuto (o skip documentato se Dockerfile invariato su push).
 7. **Qualità**: pytest verde (failOnWarning-like), ruff senza errori, test con fixture dai sample reali; logging a livelli configurabile; commenti "MAINTENANCE NOTES" in inglese.
 8. **Documentazione**: README inglese; WORKPLAN italiano presente e aggiornato; docs/ tecnici; **wiki Gitea prevista** (fallback docs/ con indice incrociato); `version.ini` con bump automatico.
 9. **Approvazione**: questo WORKPLAN approvato dall'utente il **2026-09-22** (D12, tutti i punti del §11 risolti) prima della scrittura del codice applicativo.
@@ -543,9 +547,9 @@ Pseudo-flusso operativo (da implementare come step nel job build):
 
 | # | Punto | Risposta utente | Stato |
 | --- | --- | --- | --- |
-| 1 | Nome immagine/registry (D15) | `tanadelgigante/daylio-api-server` su `docker.io`, override `vars.IMAGE_REPO` | **RISOLTO** |
+| 1 | Nome immagine/registry (D15) | `tanadelgigante/daylio-api-server` su `docker.io` (**solo al release**), override `vars.IMAGE_REPO`; **build su registry container Gitea** (modifica 2026-10-11) | **RISOLTO** |
 | 2 | Derivazione tag (D15b) | `v<version.ini>` con fallback `vars.APP_VERSION` poi `matrix.tag` | **RISOLTO** |
-| 3 | `build` su pull_request? | `build` **solo su push** | **RISOLTO** |
+| 3 | `build` su pull_request? | `build` **solo su push** (o manuale `workflow_dispatch job=build`); mai su PR | **RISOLTO** |
 | 4 | Libreria dashboard | **Chart.js** (vendored) | **RISOLTO** |
 | 5 | Auth | Sessioni itsdangerous per Web UI + API key per script | **RISOLTO** |
 | 6 | Influx bucket/org | Org **`tanadelgigante`** (non kenshiro), bucket **`daylio`**; servizio reale su **192.168.188.120**; in CI si passa `<ip>:<port>` come `vars.INFLUX_INSTANCE` → job `test` costruisce `INFLUX_URL="http://${INFLUX_INSTANCE}"` | **RISOLTO** |
@@ -553,7 +557,7 @@ Pseudo-flusso operativo (da implementare come step nel job build):
 | 8 | `ingestora_migrations.py` | Rinominare in **`db/migrations.py`** | **RISOLTO** |
 | 9 | Scheduler | **APScheduler** (non threading nativo) | **RISOLTO** |
 
-> Nota: la sezione è chiusa; non restano punti aperti su questi aspetti. Eventuali nuove richieste vanno trattate come revisione del WORKPLAN (D12).
+> Nota: la sezione è chiusa; non restano punti aperti su questi aspetti. Eventuali nuove richieste vanno trattate come revisione del WORKPLAN (D12). La **modifica 2026-10-11** sul flusso registry (build → Gitea, Docker Hub al release, build manuale forzabile) è stata approvata dall'utente ed è riflessa in D14/D15/§8.3/§8.4/§10.
 
 ---
 
