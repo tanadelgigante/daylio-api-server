@@ -21,7 +21,7 @@
 #            IMAGE_REPO (default tanadelgigante/daylio-api-server),
 #            APP_VERSION, DOCKER_REGISTRY (default docker.io)
 #   secrets: DUNGEONCACERT, DOCKER_USERNAME, DOCKER_PASSWORD, INFLUX_TOKEN,
-#            GITEA_TOKEN
+#            DUNGEONPAT
 #
 # Commit-message tokens (R9 / D9):
 #   [skip-ci]  skips lint, test, build and release (flatpress convention)
@@ -494,7 +494,8 @@ jobs:
       image: alpine:3.23
       env:
         # Token used to publish the release through the Gitea API.
-        GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        # (Gitea reserves the GITEA_ prefix, so the PAT secret is DUNGEONPAT.)
+        DUNGEONPAT: ${{ secrets.DUNGEONPAT }}
     steps:
       - name: Configure internal DNS
         run: |
@@ -558,10 +559,10 @@ jobs:
           REPO="${GITHUB_REPOSITORY#*/}"
           TAG="${{ steps.resolve_version.outputs.version }}"
           API="${GITHUB_SERVER_URL}/api/v1/repos/${OWNER}/${REPO}"
-          AUTH="Authorization: token ${GITEA_TOKEN}"
+          AUTH="Authorization: token ${DUNGEONPAT}"
 
-          if [ -z "${GITEA_TOKEN:-}" ]; then
-            echo "::error::Secret GITEA_TOKEN is required to publish the release" >&2
+          if [ -z "${DUNGEONPAT:-}" ]; then
+            echo "::error::Secret DUNGEONPAT is required to publish the release" >&2
             exit 1
           fi
 

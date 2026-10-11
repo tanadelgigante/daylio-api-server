@@ -185,7 +185,7 @@ def test_release_is_never_automatic(workflow: dict) -> None:
 def test_release_creates_the_release_and_bumps_the_version(workflow: dict) -> None:
     run = _run_text(workflow["jobs"]["release"])
     assert "/api/v1/repos/" in run
-    assert "GITEA_TOKEN" in run
+    assert "DUNGEONPAT" in run
     assert "version.ini" in run
     assert "scripts/bump_version.py" in run
     # The bump commit carries [skip-ci] so it does not re-trigger the pipeline.
