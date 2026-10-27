@@ -26,11 +26,10 @@
 # Registry flow (user decision 2026-10-11):
 #   build   -> the multi-arch image is pushed to the GITEA container registry
 #              ($GITHUB_SERVER_URL host / owner/repo), so it can be pulled and
-#              smoke-tested BEFORE any release. NO buildx/BuildKit worker:
-#              the runs-on host daemon trusts the internal Dungeon CA, so the
-#              job uses plain `docker build --platform` + `docker push` (both
-#              go through the daemon) per architecture, then assembles the
-#              multi-arch index client-side with `docker manifest`.
+#              smoke-tested BEFORE any release. Uses `buildx` with the `docker`
+#              driver (host daemon) — no docker-container BuildKit worker, so
+#              pushes go through the same trusted daemon/CA as `docker login`;
+#              QEMU binfmt is used for cross-compilation on mixed runner arch.
 #   release -> the (manual) release job pulls it from Gitea and promotes the
 #              same tag to DOCKER HUB.
 #
@@ -348,16 +347,13 @@ jobs:
           fi
 
   # ── Job 3: build & push the multi-arch image (push OR manual job=build) ─
-  # Pattern infrastructure-tools §8.3 (adapted): alpine + docker-cli + QEMU +
-  # custom CA, per-platform docker build/push through the host daemon, tag from
-  # version.ini with vars.APP_VERSION / matrix.tag fallbacks (D15b), multi-arch
-  # index via client-side `docker manifest`. The Dockerfile diff-guard applies
-  # to pushes only; a manual ``workflow_dispatch job=build`` forces the build
-  # even with an unchanged Dockerfile. The artifact goes to the GITEA container
-  # registry, NOT to Docker Hub (Docker Hub is promoted at release time). No
-  # buildx / docker-container BuildKit worker: the host daemon already trusts
-  # the internal Dungeon CA (a docker-container worker does not, hence the
-  # repeated "x509: certificate signed by unknown authority" pushes).
+  # Pattern infrastructure-tools §8.3 (adapted): alpine + docker-cli + docker-cli-buildx + QEMU +
+  # custom CA, buildx with driver `docker` (host daemon, no docker-container worker),
+  # tag from version.ini with vars.APP_VERSION / matrix.tag fallbacks (D15b), single
+  # multi-arch build/push with `--platform linux/amd64,linux/arm64`. The Dockerfile
+  # diff-guard applies to pushes only; a manual ``workflow_dispatch job=build`` forces
+  # the build even with an unchanged Dockerfile. The artifact goes to the GITEA container
+  # registry, NOT to Docker Hub (Docker Hub is promoted at release time).
   build:
     if: >-
       needs.ci-skip-check.outputs.should_skip != 'true' &&
@@ -423,13 +419,7 @@ jobs:
             done
           }
 
-          # No buildx / BuildKit container worker here: the runs-on host docker
-          # daemon already trusts the internal Dungeon CA (verified: docker
-          # pull from repo.kenshiro.lab.tana passes TLS), so plain `docker
-          # build --platform` + `docker push` go through that daemon and do not
-          # need any extra CA. `docker manifest` then assembles the multi-arch
-          # index from the CLI in this container, which also trusts the CA.
-          apk_install_with_retry git curl openssl docker-cli qemu ca-certificates nodejs
+          apk_install_with_retry git curl openssl docker-cli docker-cli-buildx qemu ca-certificates nodejs
 
           # Register QEMU binfmt handlers for cross-platform builds (arm64)
           # on the host (needed by the daemon for the --platform builds).
@@ -442,6 +432,14 @@ jobs:
           else
             echo "WARNING: Secret DUNGEONCACERT not found!"
           fi
+
+      - name: Setup Docker buildx (host daemon)
+        run: |
+          set -euo pipefail
+          docker buildx version
+          # Use the host dockerd directly. No docker-container worker.
+          docker buildx create --name host-builder --driver docker --use 2>/dev/null || docker buildx use default
+          docker buildx inspect --bootstrap
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -495,32 +493,14 @@ jobs:
 
           echo "$DUNGEONPAT" | docker login --username "$GITHUB_ACTOR" --password-stdin "$REGISTRY_HOST"
 
-          # Build each platform with the HOST daemon and push THROUGH it: the
-          # daemon already trusts the internal Dungeon CA, so `docker push`
-          # succeeds without buildx/BuildKit containers and without relaxing
-          # TLS. The per-arch tags stay in the registry; the multi-arch index
-          # (v2.0.0) is assembled client-side with `docker manifest`, which
-          # uses this job container's CA (also trusted).
-          for PLATFORM in linux/amd64 linux/arm64; do
-            ARCH="${PLATFORM#*/}"
-            echo "Building ${PLATFORM}..."
-            docker build --platform "$PLATFORM" \
-              ${{ matrix.build_args }} \
-              -t "${GITEA_IMAGE}:${TAG}-${ARCH}" \
-              -f "$DOCKERFILE" \
-              "$CONTEXT"
-            echo "Pushing ${GITEA_IMAGE}:${TAG}-${ARCH}..."
-            docker push "${GITEA_IMAGE}:${TAG}-${ARCH}"
-          done
-
-          # Idempotent assembly: a re-run/rebuild of the same tag (e.g. v2.0.0)
-          # would otherwise fail with "manifest list already exists", so the
-          # index is amended in place and then replaced in the registry.
-          echo "Assembling the multi-arch manifest list ${GITEA_IMAGE}:${TAG}..."
-          docker manifest create --amend "${GITEA_IMAGE}:${TAG}" \
-            "${GITEA_IMAGE}:${TAG}-amd64" \
-            "${GITEA_IMAGE}:${TAG}-arm64"
-          docker manifest push --purge "${GITEA_IMAGE}:${TAG}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            ${{ matrix.build_args }} \
+            --pull \
+            -t "${GITEA_IMAGE}:${TAG}" \
+            -f "$DOCKERFILE" \
+            "$CONTEXT" \
+            --push
 
           echo "TAG=${TAG}" >> "$GITHUB_ENV"
           echo "✅ ${GITEA_IMAGE}:${TAG} pushed successfully (multi-arch)"

@@ -11,12 +11,10 @@ Scope    : The CI definition is executable configuration, so it is tested like
               D14    : the ``build`` job runs on ``push`` or on a manual
                        ``workflow_dispatch job=build`` (which forces the build
                        even when the Dockerfile is unchanged), never on a
-                       pull_request, diff-guards the Dockerfile on push, builds
-                       each architecture through the HOST docker daemon
-                       (``docker build --platform`` + ``docker push``), then
-                       assembles the multi-arch index client-side with
-                       ``docker manifest`` (no buildx/BuildKit worker), and
-                       never puts a password on the command line; the artifact
+                       pull_request, diff-guards the Dockerfile on push, uses
+                       ``buildx`` with the ``docker`` driver (host daemon, no
+                       docker-container worker) for ``linux/amd64,linux/arm64``
+                       and never puts a password on the command line; the artifact
                        goes to the GITEA container registry, not to Docker Hub;
               D15    : image/tag fallbacks (vars.IMAGE_REPO, version.ini,
                        vars.APP_VERSION, matrix.tag);
@@ -158,11 +156,11 @@ def test_build_matrix_targets_the_project_image(workflow: dict) -> None:
 
 def test_build_step_follows_the_infrastructure_tools_pattern(workflow: dict) -> None:
     run = _run_text(workflow["jobs"]["build"])
-    # Custom CA + QEMU + docker CLI (no buildx worker needed).
+    # Custom CA + QEMU + docker CLI + buildx.
     assert "apk_install_with_retry" in run
-    assert "docker-cli-buildx" not in run
+    assert "docker-cli-buildx" in run
     assert "multiarch/qemu-user-static" in run
-    assert "docker buildx" not in run
+    assert "docker buildx" in run
     assert "update-ca-certificates" in run
     # Diff-guard on the Dockerfile (§8.3 step 4).
     assert "git diff --name-only HEAD~1 HEAD" in run
@@ -174,13 +172,13 @@ def test_build_step_follows_the_infrastructure_tools_pattern(workflow: dict) -> 
     assert "--password-stdin" in run
     assert "docker login --username" in run
     assert 'docker login "$DOCKER_PASSWORD"' not in run
-    # Per-platform build and push through the host daemon, then a client-side
-    # multi-arch manifest list.
-    assert "for PLATFORM in linux/amd64 linux/arm64" in run
-    assert "docker build --platform" in run
-    assert "docker push" in run
-    assert "docker manifest create" in run
-    assert "docker manifest push" in run
+    # Single multi-arch build/push via buildx (host daemon driver).
+    assert "docker buildx build" in run
+    assert "--platform linux/amd64,linux/arm64" in run
+    assert "--push" in run
+    assert "--pull" in run
+    assert "for PLATFORM" not in run
+    assert "docker manifest" not in run
 
 
 def test_build_checks_out_the_full_history(workflow: dict) -> None:
@@ -206,66 +204,49 @@ def test_build_installs_the_alpine_openssl_package(workflow: dict) -> None:
 def test_build_pushes_to_the_gitea_container_registry(workflow: dict) -> None:
     """User decision 2026-10-11: the build artifact goes to the Gitea
     container registry (so it can be smoke-tested before any release), never
-    to Docker Hub. Credentials: DUNGEONPAT via stdin, no DOCKER_* secrets.
-
-    Each architecture is built and pushed through the host daemon (no buildx),
-    then the multi-arch index is assembled client-side with ``docker manifest``.
-    """
+    to Docker Hub. Credentials: DUNGEONPAT via stdin, no DOCKER_* secrets."""
     run = _run_text(workflow["jobs"]["build"])
     assert "GITHUB_SERVER_URL" in run
     assert "docker login --username" in run
     assert "GITHUB_ACTOR" in run
     assert "--password-stdin" in run
     assert "DUNGEONPAT" in run
-    # Per-platform build/push through the host daemon + client-side manifest.
-    assert "for PLATFORM in linux/amd64 linux/arm64" in run
-    assert "docker build --platform" in run
-    assert "docker push" in run
-    assert "docker manifest create" in run
-    assert "docker manifest push" in run
+    assert "docker buildx build" in run
+    assert "--platform linux/amd64,linux/arm64" in run
+    assert "--push" in run
     # Docker Hub is strictly out of scope for the build job.
     assert "DOCKER_USERNAME" not in run
     assert "DOCKER_PASSWORD" not in run
     assert "docker.io" not in run
 
 
-def test_build_uses_the_host_daemon_not_a_buildkit_worker(workflow: dict) -> None:
-    """The build job no longer uses buildx/BuildKit.
-
-    A docker-container BuildKit worker runs in its OWN container, which cannot
-    see the internal Dungeon CA installed in the job container, so pushes to
-    the internal registry failed with "x509: certificate signed by unknown
-    authority". Instead the job builds each platform with the HOST daemon
-    (``docker build --platform`` + ``docker push``), which already trusts the
-    Dungeon CA, and assembles the multi-arch index client-side with
-    ``docker manifest`` (itself a client, hence the CA in this container is
-    also needed for ``docker login`` and the manifest push). TLS stays ENABLED:
-    no ``insecure`` registry flag and no Docker Hub reference.
-    """
+def test_build_uses_buildx_with_host_driver(workflow: dict) -> None:
+    """Use buildx with the `docker` driver (host daemon, no docker-container worker)."""
     steps = _steps(workflow["jobs"]["build"])
     run = _run_text(workflow["jobs"]["build"])
 
-    # No buildx setup step at all.
-    assert not [
-        step for step in steps if "Setup Docker buildx" in str(step.get("name", ""))
-    ], "the build job must not set up a buildx worker"
+    setup = [
+        step
+        for step in steps
+        if step.get("name") == "Setup Docker buildx (host daemon)"
+    ]
+    assert setup, "missing the host-daemon buildx setup step"
+    setup_run = setup[0]["run"]
+    assert "--driver docker" in setup_run
+    assert "docker buildx create" in setup_run
 
-    # No buildx/BuildKit-container machinery in any run block.
-    assert "docker buildx" not in run
+    assert "docker buildx build" in run
+    assert "--platform linux/amd64,linux/arm64" in run
+    assert "--push" in run
+    # Allow "no docker-container worker" in comments/descriptions, but forbid
+    # the driver/worker usage and buildx-container machinery.
+    assert "--driver docker-container" not in run
     assert "buildkit-dungeon" not in run
-    assert "docker-container" not in run
+    assert "docker manifest" not in run
+    assert "for PLATFORM" not in run
+    assert "apk_install_with_retry" in run
+    assert "docker-cli-buildx" in run
 
-    # Per-platform build/push through the host daemon, with per-arch tags.
-    assert "for PLATFORM in linux/amd64 linux/arm64" in run
-    assert "-${ARCH}" in run
-    assert "docker build --platform" in run
-    assert "docker push" in run
-    # Idempotent client-side manifest assembly (rebuilds of the same tag).
-    assert "docker manifest create --amend" in run
-    assert "docker manifest push --purge" in run
-
-    # The internal CA is still required by the *client* docker commands
-    # (docker login, docker manifest) and installed in this job container.
     ca_steps = [
         step
         for step in steps
@@ -275,7 +256,6 @@ def test_build_uses_the_host_daemon_not_a_buildkit_worker(workflow: dict) -> Non
     assert "DUNGEON_CA" in ca_steps[0].get("env", {})
     assert "update-ca-certificates" in ca_steps[0]["run"]
 
-    # TLS stays verified: no insecure registry flag, no Docker Hub.
     assert "insecure = true" not in run
     assert "docker.io" not in run
 
