@@ -276,7 +276,9 @@ connection and run it again.
 ## CI and image registries
 
 The Gitea Actions workflow (`ci.yml`) builds and publishes a multi-arch image
-(`linux/amd64,linux/arm64`) with this **two-registry flow**:
+(`linux/amd64,linux/arm64`): each architecture is built and pushed under its
+own `<tag>-<arch>` tag, then the multi-arch index `<tag>` is assembled with
+`docker manifest`. Publication follows this **two-registry flow**:
 
 1. **Build -> Gitea container registry.** The `build` job pushes the image to
    `$GITHUB_SERVER_URL` host / `<owner>/<repo>` (login with the `DUNGEONPAT`
@@ -300,19 +302,37 @@ The Gitea Actions workflow (`ci.yml`) builds and publishes a multi-arch image
    default `docker.io`). It then creates the Gitea release and bumps
    `version.ini`. A push or tag push never triggers a release.
 
-### TLS to the internal registry (BuildKit)
+### TLS to the internal registry
 
-`docker login` succeeds because the job container trusts the internal Dungeon
-CA (`DUNGEONCACERT` -> `update-ca-certificates`). The actual push, however, is
-performed **by the BuildKit worker container**, whose trust store does not
-include that CA — without a fix the build fails with `x509: certificate signed
-by unknown authority`. The build job therefore builds a **custom BuildKit image
-(`buildkit-dungeon:local`) with the CA baked in** (`FROM moby/buildkit` +
-`COPY dungeon-ca.crt` + `update-ca-certificates`) and creates the
-docker-container builder with `--driver-opt image=buildkit-dungeon:local`;
-TLS stays enabled and Docker Hub is never flagged insecure. The builder is
-recreated on every run so a stale worker built from the stock image is never
-reused.
+Both the build and the push go through the **Docker daemon of the `runs-on`
+host**, which already trusts the internal Dungeon CA. The job therefore needs
+no BuildKit/`buildx` worker: for each architecture it runs a plain
+`docker build --platform "$PLATFORM" -t "<image>:<tag>-<arch>"` followed by
+`docker push` (the per-arch tags stay in the registry), and then assembles the
+multi-arch index **client-side** from the job container:
+
+```sh
+docker manifest create --amend "<image>:<tag>" "<image>:<tag>-amd64" "<image>:<tag>-arm64"
+docker manifest push --purge "<image>:<tag>"
+```
+
+`--amend` makes a re-run of the same tag idempotent (otherwise
+`manifest list already exists`); `--purge` replaces the index in the registry.
+`docker manifest` is a client-side command, so it uses the job container's
+trust store: this is why the Dungeon CA is still installed in the job
+container (`DUNGEONCACERT` -> `update-ca-certificates`), the same CA that
+makes `docker login` succeed. TLS stays enabled end to end — no
+`insecure-registries` entry, no `buildkitd.toml`, no CA baked into an image —
+and Docker Hub (`docker.io`) is never flagged insecure.
+
+> Historical note: the previous approach used a `docker-container` BuildKit
+> builder running a **custom BuildKit image with the CA baked in**
+> (`buildkit-dungeon:local`, built from `moby/buildkit` + `COPY dungeon-ca.crt`
+> + `update-ca-certificates`), after an earlier attempt with
+> `buildkitd.toml insecure=true` had also failed. It was abandoned because the
+> worker kept rejecting pushes with `x509: certificate signed by unknown
+> authority`; routing build/push through the host daemon removes the second
+> trust store entirely.
 
 ## Troubleshooting
 

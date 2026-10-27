@@ -40,7 +40,9 @@ def test_logger_respects_threshold(captured_logs) -> None:
     assert any("warn-line" in msg for msg in captured_logs)
 
 
-def test_app_factory_and_healthz() -> None:
+def test_app_factory_and_healthz(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "baseline.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
     app = create_app()
     client = app.test_client()
     resp = client.get("/healthz")
