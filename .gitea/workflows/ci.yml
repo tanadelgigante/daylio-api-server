@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 # Combined schema, §8.2 of docs/WORKPLAN.md:
 #   0 ci-skip-check : [skip-ci] gate (flatpress pattern)
-#   1 lint          : ruff, python:3.12-slim
+#   1 lint          : ruff, python:3.14-slim
 #   2 test          : pytest (+ optional live InfluxDB integration, D18)
 #   3 build         : multi-arch Docker build&push, push events only (infra-tools)
 #   4 release       : MANUAL via workflow_dispatch only (never on push/tag)
@@ -180,13 +180,13 @@ jobs:
           echo "skip_build=$SKIP_BUILD" >> "$GITHUB_OUTPUT"
 
   # ── Job 1: lint (ruff) ──────────────────────────────────────────────────
-  # Container python:3.12-slim: lean image, pip/ruff only (§8.2 note).
+  # Container python:3.14-slim: lean image, pip/ruff only (§8.2 note).
   lint:
     if: needs.ci-skip-check.outputs.should_skip != 'true'
     needs: [ci-skip-check]
     runs-on: local
     container:
-      image: python:3.12-slim
+      image: python:3.14-slim
       env:
         PIP_DISABLE_PIP_VERSION_CHECK: "1"
         PIP_NO_CACHE_DIR: "1"
@@ -251,7 +251,7 @@ jobs:
     needs: [ci-skip-check]
     runs-on: local
     container:
-      image: python:3.12-slim
+      image: python:3.14-slim
       env:
         PIP_DISABLE_PIP_VERSION_CHECK: "1"
         PIP_NO_CACHE_DIR: "1"

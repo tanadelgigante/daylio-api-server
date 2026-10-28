@@ -8,7 +8,7 @@
 | Target | Needs |
 | --- | --- |
 | Docker deployment | Docker + Compose plugin |
-| Bare metal / dev | Python ≥ 3.12, a writable data directory, and an InfluxDB 2.x instance for the dashboard |
+| Bare metal / dev | Python ≥ 3.14, a writable data directory, and an InfluxDB 2.x instance for the dashboard |
 
 SQLite needs nothing else: the whole record store is a single file.
 
@@ -32,7 +32,7 @@ docker compose logs -f daylio_api
 ```
 
 The image is a two-stage build: locked dependencies from `requirements.lock`
-installed into a virtualenv, then a slim `python:3.12-slim` runtime that starts
+installed into a virtualenv, then a slim `python:3.14-slim` runtime that starts
 Waitress on the WSGI entry point `daylio_api.app:app`. Only `src/`,
 `version.ini` and `config/config.example.yml` are copied in; the configuration
 directory is mounted read-only at `/app/config` and the data directory at
@@ -65,7 +65,7 @@ interpolated from `.env` into the container. Two consequences:
 ### Without Docker
 
 ```sh
-python3.12 -m venv .venv && . .venv/bin/activate
+python3.14 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.lock          # or: pip install -e ".[dev]"
 CONFIG_FILE=config/config.yml \
 ADMIN_USERNAME=admin ADMIN_PASSWORD='…' SESSION_SECRET='…' \

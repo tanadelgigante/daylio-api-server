@@ -5,7 +5,7 @@ CSV and `.daylio` exports, stores **one record per user per day**, and serves th
 data through a parametric JSON API plus an analytics dashboard.
 
 - **Version:** 2.0.0 (see `version.ini`)
-- **Stack:** Python 3.12+, Flask 3, Waitress, SQLite (source of truth), InfluxDB 2.x (analytics), APScheduler
+- **Stack:** Python 3.14+, Flask 3, Waitress, SQLite (source of truth), InfluxDB 2.x (analytics), APScheduler
 - **License:** MIT
 
 ## Features
@@ -23,7 +23,7 @@ data through a parametric JSON API plus an analytics dashboard.
 ## Quick start (Docker Compose)
 
 **Requirements:** Docker with the Compose plugin (this path needs nothing else).
-Without Docker you need Python ≥ 3.12, a writable data directory, and an
+Without Docker you need Python ≥ 3.14, a writable data directory, and an
 InfluxDB 2.x instance for the dashboard — see
 [docs/OPERATIONS.md](docs/OPERATIONS.md#requirements).
 

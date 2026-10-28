@@ -371,5 +371,5 @@ def test_test_job_falls_back_to_the_fake_only_suite(workflow: dict) -> None:
 def test_test_job_runs_ruff_and_pytest_in_python_containers(workflow: dict) -> None:
     for name, check in (("lint", "ruff check src tests scripts"), ("test", "pytest")):
         job = workflow["jobs"][name]
-        assert job["container"]["image"] == "python:3.12-slim"
+        assert job["container"]["image"] == "python:3.14-slim"
         assert check in _run_text(job)

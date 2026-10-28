@@ -53,7 +53,7 @@ Two rules explain most of the design:
 
 | Layer | Choice | Why |
 | --- | --- | --- |
-| Language | Python ≥ 3.12 | `zoneinfo`, modern typing, slim images |
+| Language | Python ≥ 3.14 | `zoneinfo`, modern typing, slim images |
 | Web framework | Flask 3 | Small, blueprint-oriented, WSGI |
 | WSGI server | Waitress | Pure-Python, no C extensions to compile in the image (R10) |
 | Truth store | SQLite (`sqlite3` stdlib) | Zero-dependency, transactional, one file to back up |
