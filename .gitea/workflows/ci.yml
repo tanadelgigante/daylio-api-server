@@ -400,14 +400,11 @@ jobs:
 
       - name: Install dependencies & setup custom CA
         env:
-          DUNGEON_CA: ${{ secrets.DUNGEONCACERT }}
+          DUNGEON_CA: ${{ secrets.DUNGEONCACERT || secrets.DUNGEONCA }}
         run: |
           apk_install_with_retry() {
             local max_attempts=5
             local attempt=1
-            # apk update first (fresh index even when the mirror just flipped);
-            # apk add --no-cache would fetch the index itself, but an explicit
-            # update also covers transient mirror outages before the install.
             until apk update --quiet && apk add --no-cache "$@"; do
               if [ "$attempt" -ge "$max_attempts" ]; then
                 echo "ERROR: apk add failed after $max_attempts attempts" >&2
@@ -421,16 +418,17 @@ jobs:
 
           apk_install_with_retry git curl openssl docker-cli docker-cli-buildx qemu ca-certificates nodejs
 
-          # Register QEMU binfmt handlers for cross-platform builds (arm64)
-          # on the host (needed by the daemon for the --platform builds).
           docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
 
           if [ -n "$DUNGEON_CA" ]; then
             echo "Adding the internal CA certificate..."
             echo "$DUNGEON_CA" > /usr/local/share/ca-certificates/dungeon-ca.crt
             update-ca-certificates
+            REGISTRY_HOST="$(printf '%s' "$GITHUB_SERVER_URL" | sed -E 's#^https?://##; s#/$##')"
+            mkdir -p "/etc/docker/certs.d/${REGISTRY_HOST}"
+            echo "$DUNGEON_CA" > "/etc/docker/certs.d/${REGISTRY_HOST}/ca.crt"
           else
-            echo "WARNING: Secret DUNGEONCACERT not found!"
+            echo "WARNING: Secret DUNGEONCACERT/DUNGEONCA not found!"
           fi
 
       - name: Setup Docker buildx (host daemon)
