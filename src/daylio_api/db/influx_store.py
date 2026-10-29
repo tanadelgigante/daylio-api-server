@@ -421,39 +421,44 @@ class _InfluxClientAdapter:
         write_api = self._client.write_api()
         try:
             if isinstance(record, dict):
-                point = Point.from_dict(record)
-            else:
-                point = record
-        except Exception:
-            point = record
-        try:
-            if org:
                 try:
-                    write_api.write(bucket=bucket, org=org, record=point)
+                    point = Point.from_dict(record)
+                    line = point.to_line_protocol()
+                    if org:
+                        write_api.write(bucket=bucket, org=org, record=line)
+                    else:
+                        write_api.write(bucket=bucket, record=line)
                     return
-                except TypeError:
+                except Exception:
                     pass
-            try:
-                write_api.write(bucket=bucket, record=point)
-                return
-            except TypeError:
-                pass
-        except Exception:
-            raise
-        # Fallback: line protocol
-        try:
-            if isinstance(point, Point):
-                line = point.to_line_protocol()
-            else:
-                line = None
-            if line:
-                write_api.write(bucket=bucket, org=org, record=line)
-                return
+            elif isinstance(record, Point):
+                try:
+                    line = record.to_line_protocol()
+                    if org:
+                        write_api.write(bucket=bucket, org=org, record=line)
+                    else:
+                        write_api.write(bucket=bucket, record=line)
+                    return
+                except Exception:
+                    pass
+            elif hasattr(record, "to_line_protocol"):
+                try:
+                    line = record.to_line_protocol()
+                    if org:
+                        write_api.write(bucket=bucket, org=org, record=line)
+                    else:
+                        write_api.write(bucket=bucket, record=line)
+                    return
+                except Exception:
+                    pass
         except Exception:
             pass
-        if org:
-            write_api.write(bucket=bucket, org=org, record=record)
-        else:
+        try:
+            if org:
+                write_api.write(bucket=bucket, org=org, record=record)
+            else:
+                write_api.write(bucket=bucket, record=record)
+        except TypeError:
             write_api.write(bucket=bucket, record=record)
 
     def delete(
