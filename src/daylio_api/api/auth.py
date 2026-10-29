@@ -313,6 +313,90 @@ def admin_list_users() -> Any:
     return jsonify({"users": users}), 200
 
 
+@admin_bp.get("/settings")
+@admin_required
+def admin_get_settings() -> Any:
+    import json
+    import os
+
+    from flask import current_app
+
+    cfg = current_app.config.get("DAYLIO")
+    backend = "influx"
+    if cfg:
+        if isinstance(getattr(cfg, "storage", None), dict):
+            backend = cfg.storage.get("analytics_backend", "influx")
+        elif hasattr(cfg, "_raw"):
+            backend = (cfg._raw.get("storage") or {}).get("analytics_backend", "influx")
+    data_dir = os.environ.get("DATA_DIR") or "/data"
+    path = os.path.join(data_dir, "settings.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                s2 = json.load(f)
+            if s2.get("analytics_backend"):
+                backend = s2["analytics_backend"]
+        except Exception:
+            pass
+    return jsonify({"analytics_backend": backend}), 200
+
+
+@admin_bp.post("/settings")
+@admin_required
+def admin_set_settings() -> Any:
+    import json
+    import os
+
+    from flask import current_app, request
+
+    data = request.get_json(silent=True) or {}
+    backend = str(data.get("analytics_backend") or "").strip().lower()
+    if backend not in {"influx", "sqlite"}:
+        return jsonify({"error": "analytics_backend must be 'influx' or 'sqlite'", "type": "bad_request"}), 400
+
+    data_dir = os.environ.get("DATA_DIR") or "/data"
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        path = os.path.join(data_dir, "settings.json")
+        cur = {}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    cur = json.load(f)
+            except Exception:
+                cur = {}
+        old = str(cur.get("analytics_backend") or "influx").strip().lower()
+        cur["analytics_backend"] = backend
+        with open(path, "w") as f:
+            json.dump(cur, f, indent=2)
+        cfg = current_app.config.get("DAYLIO")
+        if cfg:
+            if isinstance(getattr(cfg, "storage", None), dict):
+                cfg.storage["analytics_backend"] = backend
+            elif hasattr(cfg, "_raw"):
+                cfg._raw.setdefault("storage", {})["analytics_backend"] = backend
+
+        result = {"ok": True, "analytics_backend": backend, "old": old}
+        if old == "sqlite" and backend == "influx":
+            result["sync_needed"] = True
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e), "type": "server_error"}), 500
+
+
+@admin_bp.post("/sync-influx")
+@admin_required
+def admin_sync_influx() -> Any:
+    from daylio_api.api.routes import _influx, _store
+    try:
+        conn = _store().connect()
+        influx = _influx()
+        stats = resync_all(conn, influx, user=None)
+        return jsonify({"ok": True, "stats": stats}), 200
+    except Exception as e:
+        return jsonify({"error": str(e), "type": "server_error"}), 500
+
+
 @admin_bp.post("/users")
 @admin_required
 def admin_create_user() -> Any:

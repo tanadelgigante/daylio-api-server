@@ -58,7 +58,7 @@ from daylio_api.audit import list_jobs
 from daylio_api.config import mood_override_values, parse_tag_group, scale_label
 from daylio_api.db.influx_store import InfluxStore
 from daylio_api.db.sqlite_store import SqliteStore, list_users_with_counts
-from daylio_api.import_flow import _failed_import_summary, import_data, import_folder
+from daylio_api.import_flow import _failed_import_summary, import_data, import_folder, resync_all
 from daylio_api.importers.base import FORMAT_CSV, FORMAT_DAYLIO, detect_format
 from daylio_api.importers.csv_importer import parse_csv
 from daylio_api.importers.daylio_importer import parse_daylio

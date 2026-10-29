@@ -586,7 +586,7 @@ def revoke_api_key(conn: sqlite3.Connection, user_id: int, key_prefix: str) -> i
 
 def user_for_api_key(conn: sqlite3.Connection, key_hash: str) -> dict[str, Any] | None:
     """Resolve an API key hash to its active user row (or None).
-
+ 
     Only non-revoked keys authenticate. A match also bumps ``last_used_at``.
     """
     row = conn.execute(
@@ -604,3 +604,57 @@ def user_for_api_key(conn: sqlite3.Connection, key_hash: str) -> dict[str, Any] 
         (int(user["key_id"]),),
     )
     return user
+
+
+# --------------------------------------------------------------------------- #
+# Analytics helpers (SQLite fallback)
+# --------------------------------------------------------------------------- #
+
+
+def list_entries_for_analytics(
+    conn: sqlite3.Connection,
+    user: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM day_entries WHERE user = ?"
+    params: list[Any] = [user]
+    if start_date:
+        sql += " AND full_date >= ?"
+        params.append(start_date)
+    if end_date:
+        sql += " AND full_date <= ?"
+        params.append(end_date)
+    sql += " ORDER BY full_date ASC"
+    rows = conn.execute(sql, params).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        rec = _row_to_record(row)
+        scales_obj = rec.get("scales") or {}
+        fields: dict[str, Any] = {
+            "mood": rec.get("mood"),
+            "mood_num": rec.get("mood"),
+            "activities": json.dumps(rec.get("activities") or [], ensure_ascii=False),
+            "scales": json.dumps(scales_obj, ensure_ascii=False),
+        }
+        for k, v in scales_obj.items():
+            if isinstance(v, dict) and v.get("value") is not None:
+                key = str(k).lower().replace(" ", "_")
+                try:
+                    fields[f"scale_{key}_value"] = int(v["value"])
+                except Exception:
+                    pass
+        tags = {"mood_label": rec.get("mood_label") or ""}
+        ss = scales_obj.get("Scala salute") or scales_obj.get("scala_salute")
+        if isinstance(ss, dict) and ss.get("label"):
+            tags["scala_salute_label"] = ss["label"]
+        out.append(
+            {
+                "date": rec.get("full_date"),
+                "time": rec.get("time") or f"{rec.get('full_date')}T00:00:00Z",
+                "user": user,
+                "fields": fields,
+                "tags": tags,
+            }
+        )
+    return out

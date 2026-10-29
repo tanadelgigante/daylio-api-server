@@ -70,6 +70,7 @@ from flask import Blueprint, abort, current_app, jsonify, request
 from daylio_api.api.auth import login_required
 from daylio_api.api.routes import _effective_user, _valid_date
 from daylio_api.config import AppConfig, scale_label
+from daylio_api.db import sqlite_store
 from daylio_api.db.influx_store import (
     InfluxStore,
     build_scale_key_map,
@@ -127,6 +128,51 @@ def _config() -> AppConfig | None:
 def _influx() -> InfluxStore | None:
     """Return the InfluxStore bootstrapped by the app factory (may be None)."""
     return current_app.extensions.get("daylio_influx")
+
+
+def _store():
+    return current_app.extensions.get("daylio_store")
+
+
+def _analytics_backend() -> str:
+    cfg = _config()
+    backend = None
+    if cfg:
+        if isinstance(getattr(cfg, "storage", None), dict):
+            backend = cfg.storage.get("analytics_backend")
+        elif hasattr(cfg, "_raw"):
+            backend = (cfg._raw.get("storage") or {}).get("analytics_backend")
+    if not backend:
+        import json
+        import os
+        data_dir = os.environ.get("DATA_DIR") or "/data"
+        path = os.path.join(data_dir, "settings.json")
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    s = json.load(f)
+                backend = s.get("analytics_backend")
+            except Exception:
+                pass
+    backend = str(backend or "influx").strip().lower()
+    if backend not in {"influx", "sqlite"}:
+        backend = "influx"
+    return backend
+
+
+def _get_analytics_points(user: str, start: str | None, end: str | None) -> list[dict[str, Any]]:
+    backend = _analytics_backend()
+    if backend == "sqlite":
+        store = _store()
+        if store is None:
+            abort(503, description="SQLite store not available")
+        conn = store.connect()
+        try:
+            return sqlite_store.list_entries_for_analytics(conn, user, start, end)
+        except Exception as exc:  # noqa: BLE001
+            log.error("SQLite analytics read failed for user=%s: %s", user, exc)
+            abort(503, description="SQLite analytics read failed")
+    return _get_analytics_points(user, start, end)
 
 
 def _require_influx() -> InfluxStore:
@@ -366,7 +412,7 @@ def analytics_mood_over_time() -> Any:
     user = _effective_user()
     start, end = _parse_range()
     granularity = _resolve_granularity(start, end)
-    points = _read_points(_require_influx(), user, start, end)
+    points = _get_analytics_points(user, start, end)
 
     buckets: dict[str, list[float]] = {}
     for point in points:
@@ -407,7 +453,7 @@ def analytics_mood_distribution() -> Any:
     """
     user = _effective_user()
     start, end = _parse_range()
-    points = _read_points(_require_influx(), user, start, end)
+    points = _get_analytics_points(user, start, end)
 
     rated = [(point, mood) for point in points if (mood := _point_mood(point)) is not None]
     moods = [mood for _, mood in rated]
@@ -477,7 +523,7 @@ def analytics_heatmap() -> Any:
     metric = (request.args.get("metric") or "mean_mood").strip().lower()
     if metric not in {"mean_mood", "count"}:
         abort(400, description="metric must be 'mean_mood' or 'count'")
-    points = _read_points(_require_influx(), user, start, end)
+    points = _get_analytics_points(user, start, end)
 
     cell_values: list[list[list[float]]] = [[[] for _ in range(24)] for _ in range(7)]
     for point in points:
@@ -555,7 +601,7 @@ def analytics_scales_trend() -> Any:
     """
     user = _effective_user()
     start, end = _parse_range()
-    points = _read_points(_require_influx(), user, start, end)
+    points = _get_analytics_points(user, start, end)
     key_map = _scale_key_map(_config())
     requested = (request.args.get("scale") or "").strip()
 
@@ -762,7 +808,7 @@ def analytics_activities_top() -> Any:
     if limit < 1 or limit > ACTIVITIES_LIMIT_MAX:
         abort(400, description=f"limit must be between 1 and {ACTIVITIES_LIMIT_MAX}")
 
-    points = _read_points(_require_influx(), user, start, end)
+    points = _get_analytics_points(user, start, end)
     excluded = _scala_salute_labels(points)
     counter: Counter[str] = Counter()
     for point in points:

@@ -210,6 +210,27 @@
           </form>
           <p id="create-user-status" class="muted small"></p>
         </section>
+
+        <section class="card wide">
+          <h3>Analytics Backend</h3>
+          <div class="row">
+            <label for="analytics-backend">Backend</label>
+            <select id="analytics-backend">
+              <option value="influx">InfluxDB</option>
+              <option value="sqlite">SQLite</option>
+            </select>
+            <button id="save-analytics-backend" class="primary" type="button">Save</button>
+            <button id="sync-influx-btn" class="secondary" type="button" style="display:none">Transfer data to InfluxDB</button>
+          </div>
+          <p id="analytics-backend-status" class="muted small"></p>
+          <div id="sync-progress" style="display:none; margin-top:10px;">
+            <div style="height:8px; background:#eee; border-radius:4px; overflow:hidden;">
+              <div id="sync-progress-bar" style="height:8px; width:0%; background:#4a90e2;"></div>
+            </div>
+            <p id="sync-progress-text" class="muted small"></p>
+          </div>
+          <p class="muted small">When switching from SQLite to InfluxDB, click "Transfer data to InfluxDB" to copy all records.</p>
+        </section>
       </div>
     </div>
 

@@ -109,29 +109,32 @@
         if (currentUser && currentUser.is_admin && $("upload-user")) {
           formData.append("user", $("upload-user").value);
         }
-        if (status) status.textContent = "Uploading...";
+        if (status) status.textContent = "Uploading... (0%)";
         if (resultEl) { hide(resultEl); resultEl.textContent = ""; }
-        fetch("/api/import", {
-          method: "POST",
-          body: formData,
-          credentials: "same-origin"
-        }).then(function (res) {
-          return res.json().then(function (data) {
-            return { ok: res.ok, data: data };
-          });
-        }).then(function (res) {
-          if (!res.ok) {
-            if (status) status.textContent = res.data.error || "Upload failed";
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", "/api/import", true);
+        xhr.withCredentials = true;
+        xhr.upload.addEventListener("progress", function (e) {
+          if (e.lengthComputable && status) {
+            var pct = Math.round((e.loaded / e.total) * 100);
+            status.textContent = "Uploading... (" + pct + "%)";
+          }
+        });
+        xhr.onreadystatechange = function () {
+          if (xhr.readyState !== 4) return;
+          var data = {};
+          try { data = JSON.parse(xhr.responseText || "{}"); } catch (e) { data = {}; }
+          if (xhr.status >= 200 && xhr.status < 300) {
+            if (status) status.textContent = "Import completed";
+            if (resultEl) {
+              resultEl.textContent = JSON.stringify(data.job || data, null, 2);
+              show(resultEl);
+            }
             return;
           }
-          if (status) status.textContent = "Import completed";
-          if (resultEl) {
-            resultEl.textContent = JSON.stringify(res.data.job, null, 2);
-            show(resultEl);
-          }
-        }).catch(function (err) {
-          if (status) status.textContent = "Error: " + err.message;
-        });
+          if (status) status.textContent = data.error || "Upload failed";
+        };
+        xhr.send(formData);
       });
     }
 
@@ -143,13 +146,21 @@
         event.preventDefault();
         var status = $("folder-status");
         var resultEl = $("folder-result");
-        if (status) status.textContent = "Scanning folder...";
+        if (status) status.textContent = "Scanning folder... (0%)";
         if (resultEl) { hide(resultEl); resultEl.textContent = ""; }
         var body = {};
         if (currentUser && currentUser.is_admin && $("folder-user")) {
           body.user = $("folder-user").value;
         }
+        var folderStart = Date.now();
+        var folderTimer = setInterval(function () {
+          var elapsed = Math.floor((Date.now() - folderStart) / 1000);
+          if (status && status.textContent.indexOf("Import") === -1 && status.textContent.indexOf("Error") === -1) {
+            status.textContent = "Scanning/importing folder... (" + elapsed + "s)";
+          }
+        }, 1000);
         request("/api/import/folder", { method: "POST", body: Object.keys(body).length ? body : undefined }).then(function (res) {
+          clearInterval(folderTimer);
           if (!res.ok) {
             if (status) status.textContent = res.data.error || "Import failed";
             return;
@@ -159,6 +170,9 @@
             resultEl.textContent = JSON.stringify(res.data.imports, null, 2);
             show(resultEl);
           }
+        }).catch(function (err) {
+          clearInterval(folderTimer);
+          if (status) status.textContent = "Error: " + err.message;
         });
       });
     }
@@ -227,6 +241,83 @@
         }
       });
       loadUsers();
+
+      // Analytics backend settings
+      var backendSel = $("analytics-backend");
+      var saveBtn = $("save-analytics-backend");
+      var syncBtn = $("sync-influx-btn");
+      var backendStatus = $("analytics-backend-status");
+      var syncWrap = $("sync-progress");
+      var syncBar = $("sync-progress-bar");
+      var syncText = $("sync-progress-text");
+
+      function updateSyncBtn() {
+        if (!syncBtn || !backendSel) return;
+        if (backendSel.value === "influx") {
+          syncBtn.style.display = "";
+        } else {
+          syncBtn.style.display = "none";
+        }
+      }
+
+      request("/api/admin/settings").then(function (res) {
+        if (res.ok && backendSel && res.data.analytics_backend) {
+          backendSel.value = res.data.analytics_backend;
+          updateSyncBtn();
+        }
+      });
+
+      if (backendSel) {
+        backendSel.addEventListener("change", updateSyncBtn);
+      }
+
+      if (saveBtn) {
+        saveBtn.addEventListener("click", function () {
+          if (!backendSel) return;
+          if (backendStatus) backendStatus.textContent = "Saving...";
+          request("/api/admin/settings", {
+            method: "POST",
+            body: { analytics_backend: backendSel.value }
+          }).then(function (res) {
+            if (!res.ok) {
+              if (backendStatus) backendStatus.textContent = res.data.error || "Failed to save";
+              return;
+            }
+            if (backendStatus) backendStatus.textContent = "Saved";
+            updateSyncBtn();
+            if (res.data.sync_needed && syncBtn) {
+              syncBtn.style.display = "";
+              if (backendStatus) backendStatus.textContent = "Saved. Click 'Transfer data to InfluxDB' to sync.";
+            }
+          });
+        });
+      }
+
+      if (syncBtn) {
+        syncBtn.addEventListener("click", function () {
+          if (syncWrap) syncWrap.style.display = "";
+          if (syncBar) syncBar.style.width = "10%";
+          if (syncText) syncText.textContent = "Starting transfer...";
+          syncBtn.disabled = true;
+          request("/api/admin/sync-influx", { method: "POST" }).then(function (res) {
+            if (syncBar) syncBar.style.width = "100%";
+            if (!res.ok) {
+              if (syncText) syncText.textContent = res.data.error || "Transfer failed";
+              syncBtn.disabled = false;
+              return;
+            }
+            var stats = res.data.stats || {};
+            if (syncText) {
+              syncText.textContent = "Done. Users: " + (stats.users || 0) + ", days: " + (stats.days || 0) + ", influx_errors: " + (stats.influx_errors || 0);
+            }
+            syncBtn.disabled = false;
+          }).catch(function (err) {
+            if (syncBar) syncBar.style.width = "100%";
+            if (syncText) syncText.textContent = "Error: " + err.message;
+            syncBtn.disabled = false;
+          });
+        });
+      }
     }
   }
 

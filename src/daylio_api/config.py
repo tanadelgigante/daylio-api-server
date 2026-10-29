@@ -631,6 +631,17 @@ def _apply_env_overrides(cfg: dict[str, Any]) -> None:
     if os.environ.get("DATA_DIR"):
         cfg.setdefault("data", {})["dir"] = os.environ["DATA_DIR"]
 
+    backend = os.environ.get("ANALYTICS_BACKEND") or os.environ.get("DASHBOARD_BACKEND") or os.environ.get("USE_INFLUX")
+    if backend is not None:
+        b = str(backend).strip().lower()
+        if b in {"0", "false", "no", "off", "sqlite", "sql"}:
+            storage["analytics_backend"] = "sqlite"
+        elif b in {"1", "true", "yes", "on", "influx", "influxdb"}:
+            storage["analytics_backend"] = "influx"
+        else:
+            storage["analytics_backend"] = b
+    storage.setdefault("analytics_backend", "influx")
+
     auth = cfg.setdefault("auth", {})
     if os.environ.get("ADMIN_USERNAME"):
         auth["admin_username"] = os.environ["ADMIN_USERNAME"]
