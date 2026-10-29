@@ -62,6 +62,7 @@ from daylio_api.db.sqlite_store import (
     user_for_api_key,
 )
 from daylio_api.logger import get_logger
+from daylio_api.import_flow import resync_all
 
 log = get_logger("api.auth")
 
@@ -352,7 +353,9 @@ def admin_set_settings() -> Any:
     data = request.get_json(silent=True) or {}
     backend = str(data.get("analytics_backend") or "").strip().lower()
     if backend not in {"influx", "sqlite"}:
-        return jsonify({"error": "analytics_backend must be 'influx' or 'sqlite'", "type": "bad_request"}), 400
+        return jsonify(
+            {"error": "analytics_backend must be 'influx' or 'sqlite'", "type": "bad_request"}
+        ), 400
 
     data_dir = os.environ.get("DATA_DIR") or "/data"
     try:

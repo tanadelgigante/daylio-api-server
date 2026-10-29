@@ -586,7 +586,7 @@ def revoke_api_key(conn: sqlite3.Connection, user_id: int, key_prefix: str) -> i
 
 def user_for_api_key(conn: sqlite3.Connection, key_hash: str) -> dict[str, Any] | None:
     """Resolve an API key hash to its active user row (or None).
- 
+
     Only non-revoked keys authenticate. A match also bumps ``last_used_at``.
     """
     row = conn.execute(

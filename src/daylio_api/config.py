@@ -631,7 +631,11 @@ def _apply_env_overrides(cfg: dict[str, Any]) -> None:
     if os.environ.get("DATA_DIR"):
         cfg.setdefault("data", {})["dir"] = os.environ["DATA_DIR"]
 
-    backend = os.environ.get("ANALYTICS_BACKEND") or os.environ.get("DASHBOARD_BACKEND") or os.environ.get("USE_INFLUX")
+    backend = os.environ.get("ANALYTICS_BACKEND")
+    if not backend:
+        backend = os.environ.get("DASHBOARD_BACKEND")
+    if not backend:
+        backend = os.environ.get("USE_INFLUX")
     if backend is not None:
         b = str(backend).strip().lower()
         if b in {"0", "false", "no", "off", "sqlite", "sql"}:
