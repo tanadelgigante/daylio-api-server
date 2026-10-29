@@ -49,7 +49,7 @@ from datetime import date as date_cls
 from datetime import timedelta
 from typing import Any
 
-from influxdb_client import InfluxDBClient
+from influxdb_client import InfluxDBClient, Point
 
 from daylio_api.config import scale_label
 from daylio_api.logger import get_logger
@@ -415,7 +415,46 @@ class _InfluxClientAdapter:
         return bool(self._client.ping())
 
     def write(self, bucket: str, record: dict[str, Any]) -> None:
-        self._client.write_api().write(bucket=bucket, record=record)
+        org = getattr(self._client, "org", None)
+        if org is None and hasattr(self._client, "_org"):
+            org = self._client._org
+        write_api = self._client.write_api()
+        try:
+            if isinstance(record, dict):
+                point = Point.from_dict(record)
+            else:
+                point = record
+        except Exception:
+            point = record
+        try:
+            if org:
+                try:
+                    write_api.write(bucket=bucket, org=org, record=point)
+                    return
+                except TypeError:
+                    pass
+            try:
+                write_api.write(bucket=bucket, record=point)
+                return
+            except TypeError:
+                pass
+        except Exception:
+            raise
+        # Fallback: line protocol
+        try:
+            if isinstance(point, Point):
+                line = point.to_line_protocol()
+            else:
+                line = None
+            if line:
+                write_api.write(bucket=bucket, org=org, record=line)
+                return
+        except Exception:
+            pass
+        if org:
+            write_api.write(bucket=bucket, org=org, record=record)
+        else:
+            write_api.write(bucket=bucket, record=record)
 
     def delete(
         self, start: str, stop: str, predicate: str, bucket: str, org: str
