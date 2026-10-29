@@ -49,6 +49,10 @@ body {
   color: var(--error);
 }
 
+.success {
+  color: var(--ok);
+}
+
 /* ---------------------------------------------------------------- header */
 .topbar {
   display: flex;
@@ -64,10 +68,29 @@ body {
   margin: 0;
 }
 
+.nav {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.nav-btn {
+  background: #fff;
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.nav-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
 .topbar-right {
   display: flex;
   gap: 0.5rem;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .badge {
@@ -114,11 +137,70 @@ body {
   font-size: 1.2rem;
 }
 
+.card h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.app-view h2 {
+  margin: 1rem 0 0.5rem;
+  font-size: 1.15rem;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
   gap: 1rem;
   margin-top: 1rem;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+.users-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.users-table th,
+.users-table td {
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+
+.users-table th {
+  color: var(--muted);
+  font-weight: 600;
+  background: #fafafa;
+}
+
+.users-table td.actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.users-table button.small {
+  padding: 0.25rem 0.45rem;
+  font-size: 0.8rem;
+}
+
+.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.result {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 0.75rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 0.8rem;
 }
 
 .chart-card h2 {
@@ -193,6 +275,12 @@ button.secondary {
   background: #fff;
   border-color: var(--line);
   color: var(--ink);
+}
+
+button.danger {
+  background: #fff;
+  border-color: var(--error);
+  color: var(--error);
 }
 
 /* ---------------------------------------------------------------- banner */

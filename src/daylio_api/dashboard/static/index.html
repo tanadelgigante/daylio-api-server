@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Daylio API Server — Dashboard</title>
+  <title>Daylio API Server</title>
   <!--
     MAINTENANCE NOTES (Fase 6, WORKPLAN §5.7 / R4):
       - Chart.js is VENDORED (no third-party CDN at runtime, D13/R10):
@@ -22,7 +22,7 @@
   <section id="login-view" class="view hidden">
     <form id="login-form" class="card login-card" autocomplete="on">
       <h1>Daylio API Server</h1>
-      <p class="muted">Sign in to load the InfluxDB dashboard.</p>
+      <p class="muted">Sign in to continue.</p>
       <label for="login-username">Username</label>
       <input id="login-username" name="username" type="text" required autofocus>
       <label for="login-password">Password</label>
@@ -32,16 +32,197 @@
     </form>
   </section>
 
-  <!-- Dashboard: shown when a session (or API key) is authenticated. -->
-  <section id="dashboard-view" class="view hidden">
+  <!-- Main app: shown when authenticated -->
+  <section id="app-view" class="view hidden">
     <header class="topbar">
-      <h1>Daylio dashboard</h1>
+      <h1>Daylio</h1>
+      <nav class="nav">
+        <button class="nav-btn active" data-view="dashboard">Dashboard</button>
+        <button class="nav-btn" data-view="import">Import</button>
+        <button class="nav-btn admin-only hidden" data-view="admin">Admin</button>
+      </nav>
       <div class="topbar-right">
         <span id="current-user" class="badge">—</span>
         <span id="influx-status" class="badge badge-muted">InfluxDB: checking…</span>
         <button id="logout-button" type="button" class="secondary">Log out</button>
       </div>
     </header>
+
+    <!-- Dashboard view -->
+    <div id="view-dashboard" class="app-view">
+      <p class="muted small">
+        Every chart below is served by <code>/api/analytics/*</code>, which reads
+        <strong>InfluxDB only</strong> (R4/D4). There is no SQL fallback.
+      </p>
+
+      <!-- Filters: date range + (admin only) user scope. -->
+      <form id="filters-form" class="card filters">
+        <div class="field">
+          <label for="start-date">From</label>
+          <input id="start-date" type="date">
+        </div>
+        <div class="field">
+          <label for="end-date">To</label>
+          <input id="end-date" type="date">
+        </div>
+        <div class="field">
+          <label for="granularity">Group by</label>
+          <select id="granularity">
+            <option value="auto">auto</option>
+            <option value="day">day</option>
+            <option value="week">week</option>
+          </select>
+        </div>
+        <div class="field hidden" id="user-field">
+          <label for="user-select">User</label>
+          <select id="user-select"></select>
+        </div>
+        <div class="field">
+          <label for="quick-range">Quick range</label>
+          <select id="quick-range">
+            <option value="30">last 30 days</option>
+            <option value="92" selected>last 92 days</option>
+            <option value="365">last year</option>
+            <option value="all">all data</option>
+          </select>
+        </div>
+        <button type="submit" id="refresh-button">Refresh</button>
+      </form>
+
+      <!-- Global status banner: 503 (InfluxDB down) / load errors land here. -->
+      <p id="status-banner" class="banner hidden" role="status"></p>
+
+      <div class="grid">
+        <section class="card chart-card wide">
+          <h2>Mood over time <span id="mood-over-time-hint" class="muted small"></span></h2>
+          <div class="chart-box"><canvas id="chart-mood-over-time"></canvas></div>
+        </section>
+
+        <section class="card chart-card">
+          <h2>Mood distribution</h2>
+          <div class="chart-box"><canvas id="chart-mood-distribution"></canvas></div>
+        </section>
+
+        <section class="card chart-card">
+          <h2>Top activities</h2>
+          <div class="chart-box"><canvas id="chart-activities-top"></canvas></div>
+        </section>
+
+        <section class="card chart-card wide">
+          <h2>Scales trend <span id="scales-trend-hint" class="muted small"></span></h2>
+          <div id="scales-trend-charts" class="scales-grid"></div>
+        </section>
+
+        <section class="card chart-card wide">
+          <h2>Mood heatmap <span class="muted small">weekday × hour</span></h2>
+          <p class="muted small">
+            Minimum custom matrix (no extra dependency): rows are weekdays
+            (Monday first), columns are hours of the point timestamp.
+          </p>
+          <div id="heatmap" class="heatmap-scroll"></div>
+          <p id="heatmap-legend" class="muted small"></p>
+        </section>
+      </div>
+    </div>
+
+    <!-- Import view -->
+    <div id="view-import" class="app-view hidden">
+      <h2>Import</h2>
+      <div class="grid">
+        <section class="card">
+          <h3>Upload backup file</h3>
+          <p class="muted small">Upload a Daylio export (.csv or .daylio)</p>
+          <form id="upload-form" enctype="multipart/form-data">
+            <div class="field">
+              <label for="upload-file">File</label>
+              <input id="upload-file" name="file" type="file" accept=".csv,.daylio" required>
+            </div>
+            <div class="field" id="upload-user-field" style="display:none">
+              <label for="upload-user">Import as user</label>
+              <select id="upload-user"></select>
+            </div>
+            <button type="submit">Upload and import</button>
+          </form>
+          <p id="upload-status" class="muted small"></p>
+          <pre id="upload-result" class="result hidden"></pre>
+        </section>
+
+        <section class="card">
+          <h3>Import from folder</h3>
+          <p class="muted small">Trigger import from configured import folder for current user</p>
+          <form id="folder-import-form">
+            <div class="field" id="folder-user-field" style="display:none">
+              <label for="folder-user">User</label>
+              <select id="folder-user"></select>
+            </div>
+            <button type="submit">Import from folder</button>
+          </form>
+          <p id="folder-status" class="muted small"></p>
+          <pre id="folder-result" class="result hidden"></pre>
+        </section>
+      </div>
+    </div>
+
+    <!-- Admin view -->
+    <div id="view-admin" class="app-view hidden">
+      <h2>Admin - User Management</h2>
+      <div class="grid">
+        <section class="card wide">
+          <h3>Users</h3>
+          <div class="table-wrap">
+            <table class="users-table">
+              <thead>
+                <tr>
+                  <th>Username</th>
+                  <th>Admin</th>
+                  <th>Import Dir</th>
+                  <th>Records</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="users-tbody"></tbody>
+            </table>
+          </div>
+          <p id="users-status" class="muted small"></p>
+        </section>
+
+        <section class="card">
+          <h3>Create new user</h3>
+          <form id="create-user-form">
+            <div class="field">
+              <label for="new-username">Username</label>
+              <input id="new-username" type="text" required>
+            </div>
+            <div class="field">
+              <label for="new-password">Password</label>
+              <input id="new-password" type="password" required>
+            </div>
+            <div class="field">
+              <label for="new-import-dir">Import directory (optional)</label>
+              <input id="new-import-dir" type="text" placeholder="/srv/daylio/username">
+            </div>
+            <div class="field checkbox">
+              <label>
+                <input id="new-is-admin" type="checkbox"> Administrator
+              </label>
+            </div>
+            <button type="submit">Create user</button>
+          </form>
+          <p id="create-user-status" class="muted small"></p>
+        </section>
+      </div>
+    </div>
+
+    <footer class="muted small">
+      Health: <a href="/healthz">/healthz</a> · API: <a href="/api/version">/api/version</a>
+    </footer>
+  </section>
+
+  <!-- Chart.js v4.5.1 (vendored, MIT) then the dashboard app. -->
+  <script src="/dashboard/static/vendor/chart.umd.min.js"></script>
+  <script src="/dashboard/static/app.js"></script>
+</body>
+</html>
 
     <p class="muted small">
       Every chart below is served by <code>/api/analytics/*</code>, which reads
