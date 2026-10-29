@@ -466,6 +466,27 @@
   /* ------------------------------------------------------------------ */
   var currentUser = null;
 
+  function loadOpsScript() {
+    if (window.__daylioOpsLoaded) {
+      if (window.__daylioOps && window.__daylioOps.setup) {
+        window.__daylioCurrentUser = currentUser;
+        window.__daylioOps.setup();
+      }
+      return;
+    }
+    window.__daylioOpsLoaded = true;
+    var script = document.createElement("script");
+    script.src = "/dashboard/static/app-ops.js";
+    script.async = true;
+    script.onload = function () {
+      window.__daylioCurrentUser = currentUser;
+      if (window.__daylioOps && window.__daylioOps.setup) {
+        window.__daylioOps.setup();
+      }
+    };
+    document.body.appendChild(script);
+  }
+
   function showView(name) {
     document.querySelectorAll(".app-view").forEach(function (el) {
       hide(el);
@@ -475,63 +496,16 @@
     document.querySelectorAll(".nav-btn").forEach(function (btn) {
       btn.classList.toggle("active", btn.getAttribute("data-view") === name);
     });
-    if (name === "admin" && currentUser && currentUser.is_admin) {
-      loadUsers();
-    }
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* Admin - User Management                                              */
-  /* ------------------------------------------------------------------ */
-  function loadUsers() {
-    var tbody = $("users-tbody");
-    var status = $("users-status");
-    if (!tbody) return;
-    tbody.innerHTML = "";
-    if (status) status.textContent = "Loading...";
-    request("/api/admin/users").then(function (result) {
-      if (!result.ok) {
-        if (status) status.textContent = result.data.error || "Failed to load users";
-        return;
+    if ((name === "admin" || name === "import") && currentUser) {
+      loadOpsScript();
+      window.__daylioCurrentUser = currentUser;
+      if (window.__daylioOps && window.__daylioOps.setup) {
+        window.__daylioOps.setup();
       }
-      if (status) status.textContent = "";
-      (result.data.users || []).forEach(function (user) {
-        var tr = document.createElement("tr");
-        var tdUser = document.createElement("td");
-        tdUser.textContent = user.username;
-        var tdAdmin = document.createElement("td");
-        tdAdmin.textContent = user.is_admin ? "Yes" : "No";
-        var tdDir = document.createElement("td");
-        tdDir.textContent = user.import_dir || "-";
-        var tdCount = document.createElement("td");
-        tdCount.textContent = user.records || 0;
-        var tdActions = document.createElement("td");
-        tdActions.className = "actions";
-        if (!(user.is_admin && (result.data.users || []).filter(function (u) { return u.is_admin; }).length <= 1)) {
-          var delBtn = document.createElement("button");
-          delBtn.type = "button";
-          delBtn.className = "danger small";
-          delBtn.textContent = "Delete";
-          delBtn.onclick = function () {
-            if (!confirm("Delete user " + user.username + "? This will remove all their data.")) return;
-            request("/api/admin/users/" + encodeURIComponent(user.username), { method: "DELETE" }).then(function (res) {
-              if (!res.ok) {
-                alert(res.data.error || "Failed to delete user");
-                return;
-              }
-              loadUsers();
-            });
-          };
-          tdActions.appendChild(delBtn);
-        }
-        tr.appendChild(tdUser);
-        tr.appendChild(tdAdmin);
-        tr.appendChild(tdDir);
-        tr.appendChild(tdCount);
-        tr.appendChild(tdActions);
-        tbody.appendChild(tr);
-      });
-    });
+      if (name === "admin" && currentUser.is_admin && window.__daylioOps && window.__daylioOps.loadUsers) {
+        window.__daylioOps.loadUsers();
+      }
+    }
   }
 
   /* ------------------------------------------------------------------ */
@@ -547,62 +521,29 @@
     currentUser = user;
     hide($("login-view"));
     show($("app-view"));
+    currentUser = user;
+    window.__daylioCurrentUser = user;
     document.querySelectorAll(".admin-only").forEach(function (el) {
       if (user.is_admin) show(el); else hide(el);
     });
     $("current-user").textContent = user.username + (user.is_admin ? " (admin)" : "");
     applyQuickRange($("quick-range").value);
     
-    // Setup upload user select for admin
-    var uploadUserField = $("upload-user-field");
-    var uploadUserSelect = $("upload-user");
-    var folderUserField = $("folder-user-field");
-    var folderUserSelect = $("folder-user");
     if (user.is_admin) {
       request("/api/users").then(function (result) {
         if (!result.ok) return;
         var users = result.data.users || [];
-        // Dashboard user select
         var select = $("user-select");
-        select.innerHTML = "";
-        users.forEach(function (item) {
-          var option = document.createElement("option");
-          option.value = item.username;
-          option.textContent = item.username;
-          select.appendChild(option);
-        });
-        select.value = user.username;
-        show($("user-field"));
-        
-        // Upload user select
-        if (uploadUserSelect) {
-          uploadUserSelect.innerHTML = "";
+        if (select) {
+          select.innerHTML = "";
           users.forEach(function (item) {
             var option = document.createElement("option");
             option.value = item.username;
             option.textContent = item.username;
-            select.appendChild ? null : null;
+            select.appendChild(option);
           });
-          users.forEach(function (item) {
-            var opt = document.createElement("option");
-            opt.value = item.username;
-            opt.textContent = item.username;
-            uploadUserSelect.appendChild(opt);
-          });
-          uploadUserSelect.value = user.username;
-          if (uploadUserField) show(uploadUserField);
-        }
-        // Folder user select
-        if (folderUserSelect) {
-          folderUserSelect.innerHTML = "";
-          users.forEach(function (item) {
-            var opt = document.createElement("option");
-            opt.value = item.username;
-            opt.textContent = item.username;
-            folderUserSelect.appendChild(opt);
-          });
-          folderUserSelect.value = user.username;
-          if (folderUserField) show(folderUserField);
+          select.value = user.username;
+          show($("user-field"));
         }
         loadAnalytics();
       });
@@ -681,107 +622,6 @@
     if ($("user-select")) {
       $("user-select").addEventListener("change", function () {
         loadAnalytics();
-      });
-    }
-
-    // Upload form
-    var uploadForm = $("upload-form");
-    if (uploadForm) {
-      uploadForm.addEventListener("submit", function (event) {
-        event.preventDefault();
-        var fileInput = $("upload-file");
-        var status = $("upload-status");
-        var resultEl = $("upload-result");
-        var file = fileInput.files[0];
-        if (!file) {
-          if (status) status.textContent = "Please select a file";
-          return;
-        }
-        var formData = new FormData();
-        formData.append("file", file);
-        if (currentUser && currentUser.is_admin && $("upload-user")) {
-          formData.append("user", $("upload-user").value);
-        }
-        if (status) status.textContent = "Uploading...";
-        if (resultEl) { hide(resultEl); resultEl.textContent = ""; }
-        fetch("/api/import", {
-          method: "POST",
-          body: formData,
-          credentials: "same-origin"
-        }).then(function (res) {
-          return res.json().then(function (data) {
-            return { ok: res.ok, data: data };
-          });
-        }).then(function (res) {
-          if (!res.ok) {
-            if (status) status.textContent = res.data.error || "Upload failed";
-            return;
-          }
-          if (status) status.textContent = "Import completed";
-          if (resultEl) {
-            resultEl.textContent = JSON.stringify(res.data.job, null, 2);
-            show(resultEl);
-          }
-        }).catch(function (err) {
-          if (status) status.textContent = "Error: " + err.message;
-        });
-      });
-    }
-
-    // Folder import form
-    var folderForm = $("folder-import-form");
-    if (folderForm) {
-      folderForm.addEventListener("submit", function (event) {
-        event.preventDefault();
-        var status = $("folder-status");
-        var resultEl = $("folder-result");
-        if (status) status.textContent = "Scanning folder...";
-        if (resultEl) { hide(resultEl); resultEl.textContent = ""; }
-        var body = {};
-        if (currentUser && currentUser.is_admin && $("folder-user")) {
-          body.user = $("folder-user").value;
-        }
-        request("/api/import/folder", { method: "POST", body: Object.keys(body).length ? body : undefined }).then(function (res) {
-          if (!res.ok) {
-            if (status) status.textContent = res.data.error || "Import failed";
-            return;
-          }
-          if (status) status.textContent = "Import completed";
-          if (resultEl) {
-            resultEl.textContent = JSON.stringify(res.data.imports, null, 2);
-            show(resultEl);
-          }
-        });
-      });
-    }
-
-    // Create user form
-    var createUserForm = $("create-user-form");
-    if (createUserForm) {
-      createUserForm.addEventListener("submit", function (event) {
-        event.preventDefault();
-        var status = $("create-user-status");
-        if (status) status.textContent = "Creating...";
-        request("/api/admin/users", {
-          method: "POST",
-          body: {
-            username: $("new-username").value,
-            password: $("new-password").value,
-            import_dir: $("new-import-dir").value || null,
-            is_admin: $("new-is-admin").checked
-          }
-        }).then(function (res) {
-          if (!res.ok) {
-            if (status) status.textContent = res.data.error || "Failed to create user";
-            return;
-          }
-          if (status) status.textContent = "User created";
-          $("new-username").value = "";
-          $("new-password").value = "";
-          $("new-import-dir").value = "";
-          $("new-is-admin").checked = false;
-          loadUsers();
-        });
       });
     }
 
