@@ -49,6 +49,16 @@ from datetime import date as date_cls
 from datetime import timedelta
 from typing import Any
 
+try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover
+    requests = None  # type: ignore
+
+try:
+    import urllib3  # type: ignore
+except Exception:  # pragma: no cover
+    urllib3 = None  # type: ignore
+
 from influxdb_client import InfluxDBClient, Point
 
 from daylio_api.config import scale_label
@@ -416,50 +426,65 @@ class _InfluxClientAdapter:
 
     def write(self, bucket: str, record: dict[str, Any]) -> None:
         org = getattr(self._client, "org", None)
-        if org is None and hasattr(self._client, "_org"):
-            org = self._client._org
-        write_api = self._client.write_api()
+        if org is None:
+            opts = getattr(self._client, "_options", None)
+            org = getattr(opts, "org", None) if opts is not None else None
+        url = getattr(self._client, "url", None)
+        if url is None:
+            opts = getattr(self._client, "_options", None)
+            url = getattr(opts, "url", None) if opts is not None else None
+        token = getattr(self._client, "token", None)
+        if token is None:
+            opts = getattr(self._client, "_options", None)
+            token = getattr(opts, "token", None) if opts is not None else None
+
+        line = None
         try:
-            if isinstance(record, dict):
-                try:
-                    point = Point.from_dict(record)
-                    line = point.to_line_protocol()
-                    if org:
-                        write_api.write(bucket=bucket, org=org, record=line)
-                    else:
-                        write_api.write(bucket=bucket, record=line)
-                    return
-                except Exception:
-                    pass
+            if isinstance(record, str):
+                line = record
+            elif isinstance(record, dict):
+                point = Point.from_dict(record)
+                line = point.to_line_protocol()
             elif isinstance(record, Point):
-                try:
-                    line = record.to_line_protocol()
-                    if org:
-                        write_api.write(bucket=bucket, org=org, record=line)
-                    else:
-                        write_api.write(bucket=bucket, record=line)
-                    return
-                except Exception:
-                    pass
+                line = record.to_line_protocol()
             elif hasattr(record, "to_line_protocol"):
-                try:
-                    line = record.to_line_protocol()
-                    if org:
-                        write_api.write(bucket=bucket, org=org, record=line)
-                    else:
-                        write_api.write(bucket=bucket, record=line)
-                    return
-                except Exception:
-                    pass
+                line = record.to_line_protocol()
         except Exception:
-            pass
-        try:
-            if org:
-                write_api.write(bucket=bucket, org=org, record=record)
-            else:
-                write_api.write(bucket=bucket, record=record)
-        except TypeError:
-            write_api.write(bucket=bucket, record=record)
+            line = None
+
+        if line is None or not url or not token or not org or not bucket:
+            raise RuntimeError("Influx write failed: missing connection params or line protocol")
+
+        write_url = f"{url.rstrip('/')}/api/v2/write"
+        headers = {
+            "Authorization": f"Token {token}",
+            "Content-Type": "text/plain; charset=utf-8",
+            "Accept": "application/json",
+        }
+        params = {"org": org, "bucket": bucket, "precision": "ns"}
+        body = line.encode("utf-8") if isinstance(line, str) else line
+
+        if requests is not None:
+            resp = requests.post(write_url, params=params, headers=headers, data=body, timeout=10)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Influx write failed ({resp.status_code}): {resp.text}")
+            return
+
+        if urllib3 is not None:
+            http = urllib3.PoolManager()
+            resp = http.request("POST", write_url, body=body, headers=headers, fields=params)
+            status = getattr(resp, "status", getattr(resp, "status_code", 0))
+            data = getattr(resp, "data", b"")
+            if status >= 400:
+                text = (
+                    data.decode("utf-8", errors="replace")
+                    if isinstance(data, (bytes, bytearray))
+                    else str(data)
+                )
+                raise RuntimeError(f"Influx write failed ({status}): {text}")
+            return
+
+        raise RuntimeError("Influx write failed: no HTTP client available")
 
     def delete(
         self, start: str, stop: str, predicate: str, bucket: str, org: str
