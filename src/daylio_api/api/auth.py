@@ -61,8 +61,8 @@ from daylio_api.db.sqlite_store import (
     user_by_username,
     user_for_api_key,
 )
-from daylio_api.logger import get_logger
 from daylio_api.import_flow import resync_all
+from daylio_api.logger import get_logger
 
 log = get_logger("api.auth")
 

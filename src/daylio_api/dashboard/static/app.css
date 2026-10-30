@@ -9,15 +9,16 @@
  */
 
 :root {
-  --bg: #f4f6f5;
+  --bg: #f7f9fc;
   --card: #ffffff;
-  --ink: #1b1f1e;
-  --muted: #5f6b68;
-  --line: #d9e0dd;
-  --accent: #1565c0;
-  --ok: #2e7d32;
-  --warn: #ef6c00;
-  --error: #c62828;
+  --ink: #1f2937;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --accent: #4a90e2;
+  --accent-hover: #357abd;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --error: #ef4444;
 }
 
 * {
