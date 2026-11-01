@@ -172,7 +172,8 @@ def _get_analytics_points(user: str, start: str | None, end: str | None) -> list
         except Exception as exc:  # noqa: BLE001
             log.error("SQLite analytics read failed for user=%s: %s", user, exc)
             abort(503, description="SQLite analytics read failed")
-    return _get_analytics_points(user, start, end)
+    store = _require_influx()
+    return _read_points(store, user, start, end)
 
 
 def _require_influx() -> InfluxStore:
