@@ -646,6 +646,19 @@ def _apply_env_overrides(cfg: dict[str, Any]) -> None:
             storage["analytics_backend"] = b
     storage.setdefault("analytics_backend", "influx")
 
+    write_backend = os.environ.get("WRITE_BACKEND")
+    if not write_backend:
+        write_backend = os.environ.get("ANALYTICS_WRITE_BACKEND")
+    if write_backend is not None:
+        wb = str(write_backend).strip().lower()
+        if wb in {"sqlite_only", "local_only", "sqlite"}:
+            storage["write_backend"] = "sqlite_only"
+        elif wb in {"sqlite_and_influx", "local_and_influx", "both"}:
+            storage["write_backend"] = "sqlite_and_influx"
+        else:
+            storage["write_backend"] = wb
+    storage.setdefault("write_backend", "sqlite_only")
+
     auth = cfg.setdefault("auth", {})
     if os.environ.get("ADMIN_USERNAME"):
         auth["admin_username"] = os.environ["ADMIN_USERNAME"]

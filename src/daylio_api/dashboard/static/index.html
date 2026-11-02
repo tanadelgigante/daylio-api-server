@@ -215,10 +215,17 @@
         <section class="card wide">
           <h3>Analytics Backend</h3>
           <div class="row">
-            <label for="analytics-backend">Backend</label>
-            <select id="analytics-backend">
+            <label for="analytics-read-backend">Read from</label>
+            <select id="analytics-read-backend">
               <option value="influx">InfluxDB</option>
-              <option value="sqlite">SQLite</option>
+              <option value="sqlite">SQLite (local)</option>
+            </select>
+          </div>
+          <div class="row">
+            <label for="analytics-write-backend">Save to</label>
+            <select id="analytics-write-backend">
+              <option value="sqlite_only">SQLite only (local)</option>
+              <option value="sqlite_and_influx">SQLite + InfluxDB</option>
             </select>
             <button id="save-analytics-backend" class="primary" type="button">Save</button>
             <button id="sync-influx-btn" class="secondary" type="button" style="display:none">Transfer data to InfluxDB</button>
@@ -230,7 +237,7 @@
             </div>
             <p id="sync-progress-text" class="muted small"></p>
           </div>
-          <p class="muted small">When switching from SQLite to InfluxDB, click "Transfer data to InfluxDB" to copy all records.</p>
+          <p class="muted small">Read from Influx or local SQLite; write to local only or local + Influx. When enabling Influx writes, sync existing data.</p>
         </section>
       </div>
     </div>
@@ -239,3 +246,9 @@
       Health: <a href="/healthz">/healthz</a> · API: <a href="/api/version">/api/version</a>
     </footer>
   </section>
+
+  <!-- Chart.js v4.5.1 (vendored, MIT) then the dashboard app. -->
+  <script src="/dashboard/static/vendor/chart.umd.min.js"></script>
+  <script src="/dashboard/static/app.js"></script>
+</body>
+</html>

@@ -243,7 +243,8 @@
       loadUsers();
 
       // Analytics backend settings
-      var backendSel = $("analytics-backend");
+      var readSel = $("analytics-read-backend");
+      var writeSel = $("analytics-write-backend");
       var saveBtn = $("save-analytics-backend");
       var syncBtn = $("sync-influx-btn");
       var backendStatus = $("analytics-backend-status");
@@ -252,8 +253,8 @@
       var syncText = $("sync-progress-text");
 
       function updateSyncBtn() {
-        if (!syncBtn || !backendSel) return;
-        if (backendSel.value === "influx") {
+        if (!syncBtn || !writeSel) return;
+        if (writeSel.value === "sqlite_and_influx") {
           syncBtn.style.display = "";
         } else {
           syncBtn.style.display = "none";
@@ -261,23 +262,28 @@
       }
 
       request("/api/admin/settings").then(function (res) {
-        if (res.ok && backendSel && res.data.analytics_backend) {
-          backendSel.value = res.data.analytics_backend;
+        if (res.ok) {
+          if (readSel && res.data.analytics_backend) {
+            readSel.value = res.data.analytics_backend;
+          }
+          if (writeSel && res.data.write_backend) {
+            writeSel.value = res.data.write_backend;
+          }
           updateSyncBtn();
         }
       });
 
-      if (backendSel) {
-        backendSel.addEventListener("change", updateSyncBtn);
+      if (writeSel) {
+        writeSel.addEventListener("change", updateSyncBtn);
       }
 
       if (saveBtn) {
         saveBtn.addEventListener("click", function () {
-          if (!backendSel) return;
+          if (!readSel || !writeSel) return;
           if (backendStatus) backendStatus.textContent = "Saving...";
           request("/api/admin/settings", {
             method: "POST",
-            body: { analytics_backend: backendSel.value }
+            body: { analytics_backend: readSel.value, write_backend: writeSel.value }
           }).then(function (res) {
             if (!res.ok) {
               if (backendStatus) backendStatus.textContent = res.data.error || "Failed to save";
@@ -287,7 +293,7 @@
             updateSyncBtn();
             if (res.data.sync_needed && syncBtn) {
               syncBtn.style.display = "";
-              if (backendStatus) backendStatus.textContent = "Saved. Click 'Transfer data to InfluxDB' to sync.";
+              if (backendStatus) backendStatus.textContent = "Saved. Click 'Transfer data to InfluxDB' to sync existing data.";
             }
           });
         });

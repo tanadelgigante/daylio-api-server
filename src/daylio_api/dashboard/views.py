@@ -70,7 +70,6 @@ from flask import Blueprint, abort, current_app, jsonify, request
 from daylio_api.api.auth import login_required
 from daylio_api.api.routes import _effective_user, _valid_date
 from daylio_api.config import AppConfig, scale_label
-from daylio_api.db import sqlite_store
 from daylio_api.db.influx_store import (
     InfluxStore,
     build_scale_key_map,
@@ -168,7 +167,9 @@ def _get_analytics_points(user: str, start: str | None, end: str | None) -> list
             abort(503, description="SQLite store not available")
         conn = store.connect()
         try:
-            return sqlite_store.list_entries_for_analytics(conn, user, start, end)
+            from daylio_api.db import sqlite_store as _sqlite_store
+
+            return _sqlite_store.list_entries_for_analytics(conn, user, start, end)
         except Exception as exc:  # noqa: BLE001
             log.error("SQLite analytics read failed for user=%s: %s", user, exc)
             abort(503, description="SQLite analytics read failed")

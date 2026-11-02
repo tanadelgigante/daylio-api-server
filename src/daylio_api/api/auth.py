@@ -324,11 +324,15 @@ def admin_get_settings() -> Any:
 
     cfg = current_app.config.get("DAYLIO")
     backend = "influx"
+    write_backend = "sqlite_only"
     if cfg:
         if isinstance(getattr(cfg, "storage", None), dict):
-            backend = cfg.storage.get("analytics_backend", "influx")
+            backend = cfg.storage.get("analytics_backend", backend)
+            write_backend = cfg.storage.get("write_backend", write_backend)
         elif hasattr(cfg, "_raw"):
-            backend = (cfg._raw.get("storage") or {}).get("analytics_backend", "influx")
+            storage_raw = cfg._raw.get("storage") or {}
+            backend = storage_raw.get("analytics_backend", backend)
+            write_backend = storage_raw.get("write_backend", write_backend)
     data_dir = os.environ.get("DATA_DIR") or "/data"
     path = os.path.join(data_dir, "settings.json")
     if os.path.exists(path):
@@ -336,10 +340,16 @@ def admin_get_settings() -> Any:
             with open(path) as f:
                 s2 = json.load(f)
             if s2.get("analytics_backend"):
-                backend = s2["analytics_backend"]
+                backend = str(s2["analytics_backend"]).strip().lower()
+            if s2.get("write_backend"):
+                write_backend = str(s2["write_backend"]).strip().lower()
         except Exception:
             pass
-    return jsonify({"analytics_backend": backend}), 200
+    if backend not in {"influx", "sqlite"}:
+        backend = "influx"
+    if write_backend not in {"sqlite_only", "sqlite_and_influx"}:
+        write_backend = "sqlite_only"
+    return jsonify({"analytics_backend": backend, "write_backend": write_backend}), 200
 
 
 @admin_bp.post("/settings")
@@ -351,36 +361,68 @@ def admin_set_settings() -> Any:
     from flask import current_app, request
 
     data = request.get_json(silent=True) or {}
-    backend = str(data.get("analytics_backend") or "").strip().lower()
-    if backend not in {"influx", "sqlite"}:
-        return jsonify(
-            {"error": "analytics_backend must be 'influx' or 'sqlite'", "type": "bad_request"}
-        ), 400
+    backend = data.get("analytics_backend")
+    write_backend = data.get("write_backend")
 
+    cur = {}
     data_dir = os.environ.get("DATA_DIR") or "/data"
     try:
         os.makedirs(data_dir, exist_ok=True)
         path = os.path.join(data_dir, "settings.json")
-        cur = {}
         if os.path.exists(path):
             try:
                 with open(path) as f:
                     cur = json.load(f)
             except Exception:
                 cur = {}
-        old = str(cur.get("analytics_backend") or "influx").strip().lower()
-        cur["analytics_backend"] = backend
+
+        result = {"ok": True}
+        sync_needed = False
+        old_read = str(cur.get("analytics_backend") or "influx").strip().lower()
+        old_write = str(cur.get("write_backend") or "sqlite_only").strip().lower()
+
+        if backend is not None:
+            backend_s = str(backend).strip().lower()
+            if backend_s not in {"influx", "sqlite"}:
+                return jsonify(
+                    {"error": "analytics_backend must be 'influx' or 'sqlite'", "type": "bad_request"}
+                ), 400
+            cur["analytics_backend"] = backend_s
+            result["analytics_backend"] = backend_s
+            result["old_analytics_backend"] = old_read
+            if old_read == "sqlite" and backend_s == "influx":
+                sync_needed = True
+
+        if write_backend is not None:
+            wb_s = str(write_backend).strip().lower()
+            if wb_s not in {"sqlite_only", "sqlite_and_influx"}:
+                return jsonify(
+                    {"error": "write_backend must be 'sqlite_only' or 'sqlite_and_influx'", "type": "bad_request"}
+                ), 400
+            cur["write_backend"] = wb_s
+            result["write_backend"] = wb_s
+            result["old_write_backend"] = old_write
+            if old_write == "sqlite_only" and wb_s == "sqlite_and_influx":
+                sync_needed = True
+
         with open(path, "w") as f:
             json.dump(cur, f, indent=2)
+
         cfg = current_app.config.get("DAYLIO")
         if cfg:
             if isinstance(getattr(cfg, "storage", None), dict):
-                cfg.storage["analytics_backend"] = backend
+                if "analytics_backend" in cur:
+                    cfg.storage["analytics_backend"] = cur["analytics_backend"]
+                if "write_backend" in cur:
+                    cfg.storage["write_backend"] = cur["write_backend"]
             elif hasattr(cfg, "_raw"):
-                cfg._raw.setdefault("storage", {})["analytics_backend"] = backend
+                storage_raw = cfg._raw.setdefault("storage", {})
+                if "analytics_backend" in cur:
+                    storage_raw["analytics_backend"] = cur["analytics_backend"]
+                if "write_backend" in cur:
+                    storage_raw["write_backend"] = cur["write_backend"]
 
-        result = {"ok": True, "analytics_backend": backend, "old": old}
-        if old == "sqlite" and backend == "influx":
+        if sync_needed:
             result["sync_needed"] = True
         return jsonify(result), 200
     except Exception as e:

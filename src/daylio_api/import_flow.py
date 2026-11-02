@@ -234,7 +234,30 @@ def import_data(
                     summary.updated += 1
                 if influx_on:
                     try:
-                        influx.write_entry(user, entry, measurement=influx.config.measurement)
+                        try:
+                            import os, json
+                            from flask import current_app
+                            write_backend = "sqlite_only"
+                            cfg = current_app.config.get("DAYLIO") if current_app else None
+                            if cfg:
+                                if isinstance(getattr(cfg, "storage", None), dict):
+                                    write_backend = cfg.storage.get("write_backend", write_backend)
+                                elif hasattr(cfg, "_raw"):
+                                    write_backend = (cfg._raw.get("storage") or {}).get("write_backend", write_backend)
+                            data_dir = os.environ.get("DATA_DIR") or "/data"
+                            sp = os.path.join(data_dir, "settings.json")
+                            if os.path.exists(sp):
+                                try:
+                                    with open(sp) as f:
+                                        ss = json.load(f)
+                                    if ss.get("write_backend"):
+                                        write_backend = ss["write_backend"]
+                                except Exception:
+                                    pass
+                            if str(write_backend).strip().lower() == "sqlite_and_influx":
+                                influx.write_entry(user, entry, measurement=influx.config.measurement)
+                        except Exception:
+                            pass
                     except Exception as exc:  # noqa: BLE001 — per-day tolerance, R8
                         summary.influx_errors += 1
                         summary.detail.append(
