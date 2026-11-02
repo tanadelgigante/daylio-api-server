@@ -240,7 +240,7 @@ def import_data(
 
                             from flask import current_app
 
-                            write_backend = "sqlite_only"
+                            write_backend = "sqlite_and_influx"
                             cfg = current_app.config.get("DAYLIO") if current_app else None
                             if cfg:
                                 if isinstance(getattr(cfg, "storage", None), dict):

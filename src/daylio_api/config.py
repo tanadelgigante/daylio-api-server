@@ -657,7 +657,7 @@ def _apply_env_overrides(cfg: dict[str, Any]) -> None:
             storage["write_backend"] = "sqlite_and_influx"
         else:
             storage["write_backend"] = wb
-    storage.setdefault("write_backend", "sqlite_only")
+    storage.setdefault("write_backend", "sqlite_and_influx")
 
     auth = cfg.setdefault("auth", {})
     if os.environ.get("ADMIN_USERNAME"):
