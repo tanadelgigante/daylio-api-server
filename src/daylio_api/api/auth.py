@@ -384,9 +384,8 @@ def admin_set_settings() -> Any:
         if backend is not None:
             backend_s = str(backend).strip().lower()
             if backend_s not in {"influx", "sqlite"}:
-                return jsonify(
-                    {"error": "analytics_backend must be 'influx' or 'sqlite'", "type": "bad_request"}
-                ), 400
+                msg = "analytics_backend must be 'influx' or 'sqlite'"
+                return jsonify({"error": msg, "type": "bad_request"}), 400
             cur["analytics_backend"] = backend_s
             result["analytics_backend"] = backend_s
             result["old_analytics_backend"] = old_read
@@ -396,9 +395,8 @@ def admin_set_settings() -> Any:
         if write_backend is not None:
             wb_s = str(write_backend).strip().lower()
             if wb_s not in {"sqlite_only", "sqlite_and_influx"}:
-                return jsonify(
-                    {"error": "write_backend must be 'sqlite_only' or 'sqlite_and_influx'", "type": "bad_request"}
-                ), 400
+                msg = "write_backend must be 'sqlite_only' or 'sqlite_and_influx'"
+                return jsonify({"error": msg, "type": "bad_request"}), 400
             cur["write_backend"] = wb_s
             result["write_backend"] = wb_s
             result["old_write_backend"] = old_write
